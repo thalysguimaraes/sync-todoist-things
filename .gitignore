@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.wrangler/
+.env
+.env.local
+.DS_Store
+*.log
+.claude/
+test-local.sh
+sync-manual.sh

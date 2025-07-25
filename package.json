@@ -1,0 +1,20 @@
+{
+  "name": "todoist-things-cfworker",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "description": "",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250725.0",
+    "typescript": "^5.8.3",
+    "wrangler": "^4.26.0"
+  }
+}

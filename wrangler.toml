@@ -1,0 +1,8 @@
+name = "todoist-things-sync"
+main = "src/index.ts"
+compatibility_date = "2025-07-25"
+
+[vars]
+TODOIST_API_URL = "https://api.todoist.com/rest/v2"
+
+# Run `wrangler secret put TODOIST_API_TOKEN` to set your token
