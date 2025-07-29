@@ -1,7 +1,7 @@
 #!/usr/bin/osascript
 
 -- Read tasks from Things inbox and output as JSON
--- Returns only tasks that don't have the tag "synced-from-todoist"
+-- Returns only tasks that don't have the tags "synced-from-todoist" or "synced-to-todoist"
 
 on run
     set json_output to "["
@@ -12,9 +12,9 @@ on run
         set inbox_todos to to dos of list "Inbox"
         
         repeat with todo_item in inbox_todos
-            -- Skip if already synced from Todoist
+            -- Skip if already synced (either direction)
             set todo_tags to tag names of todo_item
-            if "synced-from-todoist" is not in todo_tags then
+            if "synced-from-todoist" is not in todo_tags and "synced-to-todoist" is not in todo_tags then
                 -- Skip completed or cancelled tasks
                 if status of todo_item is open then
                     -- Build JSON object
@@ -92,7 +92,7 @@ on get_tags_json(tag_list)
     set first_tag to true
     
     repeat with tag_name in tag_list
-        if tag_name is not "synced-from-todoist" then
+        if tag_name is not "synced-from-todoist" and tag_name is not "synced-to-todoist" then
             if not first_tag then
                 set json_tags to json_tags & ","
             end if

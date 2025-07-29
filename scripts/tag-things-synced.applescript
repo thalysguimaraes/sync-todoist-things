@@ -1,7 +1,8 @@
 #!/usr/bin/osascript
 
--- Add "synced-from-todoist" tag to tasks in Things
+-- Add "synced-to-todoist" tag to tasks in Things
 -- This prevents them from being synced back to Todoist
+-- These are tasks that originated in Things and were synced to Todoist
 -- Expects JSON format: [{"thingsId": "xxx", "todoistId": "yyy"}, ...]
 
 on run argv
@@ -30,14 +31,14 @@ on run argv
                 if targetTodo is not missing value then
                     -- Check if already has the tag
                     set existing_tags to tag names of targetTodo
-                    if "synced-from-todoist" is not in existing_tags then
+                    if "synced-to-todoist" is not in existing_tags then
                         -- Create tag if it doesn't exist
-                        if not (exists tag "synced-from-todoist") then
-                            make new tag with properties {name:"synced-from-todoist"}
+                        if not (exists tag "synced-to-todoist") then
+                            make new tag with properties {name:"synced-to-todoist"}
                         end if
                         
                         -- Add tag to task
-                        set tag names of targetTodo to existing_tags & "synced-from-todoist"
+                        set tag names of targetTodo to existing_tags & "synced-to-todoist"
                         set tagged_count to tagged_count + 1
                     end if
                     

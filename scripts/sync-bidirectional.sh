@@ -70,29 +70,34 @@ else
         -d "$things_tasks")
     
     if [ $? -eq 0 ]; then
-        created=$(echo "$sync_response" | grep -o '"created":[0-9]*' | cut -d':' -f2)
-        existing=$(echo "$sync_response" | grep -o '"existing":[0-9]*' | cut -d':' -f2)
-        errors=$(echo "$sync_response" | grep -o '"errors":[0-9]*' | cut -d':' -f2)
+        # Extract summary values from nested JSON structure
+        created=$(echo "$sync_response" | grep -o '"summary":{[^}]*"created":[0-9]*' | grep -o '"created":[0-9]*' | cut -d':' -f2)
+        existing=$(echo "$sync_response" | grep -o '"summary":{[^}]*"existing":[0-9]*' | grep -o '"existing":[0-9]*' | cut -d':' -f2)
+        errors=$(echo "$sync_response" | grep -o '"summary":{[^}]*"errors":[0-9]*' | grep -o '"errors":[0-9]*' | cut -d':' -f2)
         
         log "Things → Todoist: $created created, $existing already existed, $errors errors"
         
         # Tag synced tasks in Things
         if [ "$created" -gt 0 ] 2>/dev/null; then
-            # Extract successful mappings from the response
-            task_mappings=$(echo "$sync_response" | 
-                grep -o '"id":"[^"]*","title":"[^"]*","status":"created","todoist_id":"[^"]*"' | 
-                sed 's/"id":"/\{"thingsId":"/g' | 
-                sed 's/","title":"[^"]*","status":"created","todoist_id":"/","todoistId":"/g' | 
-                sed 's/$/\}/g' | 
-                tr '\n' ',' | 
-                sed 's/,$//' | 
-                sed 's/^/[/' | 
-                sed 's/$/]/')
+            # Extract successful mappings from the response using jq
+            # First check if jq is available, otherwise use a more robust grep approach
+            if command -v jq > /dev/null 2>&1; then
+                task_mappings=$(echo "$sync_response" | jq -c '[.results[] | select(.status == "created") | {thingsId: .id, todoistId: .todoist_id}]')
+            else
+                # More robust extraction without jq
+                task_mappings=$(echo "$sync_response" | 
+                    perl -ne 'while (/"id":"([^"]+)"[^}]*"status":"created"[^}]*"todoist_id":"([^"]+)"/g) { print "{\"thingsId\":\"$1\",\"todoistId\":\"$2\"}," }' | 
+                    sed 's/,$//' | 
+                    sed 's/^/[/' | 
+                    sed 's/$/]/')
+            fi
             
-            if [ -n "$task_mappings" ] && [ "$task_mappings" != "[]" ]; then
-                log "Tagging $created newly synced tasks in Things"
+            if [ -n "$task_mappings" ] && [ "$task_mappings" != "[]" ] && [ "$task_mappings" != "null" ]; then
+                log "Tagging $created newly synced tasks in Things with mappings: $task_mappings"
                 tag_result=$("${SCRIPT_DIR}/tag-things-synced.applescript" "$task_mappings" 2>&1)
                 log "Things tagging result: $tag_result"
+            else
+                log "WARNING: Created $created tasks but could not extract mappings for tagging"
             fi
         fi
     else
