@@ -1,6 +1,7 @@
 export interface Env {
   TODOIST_API_TOKEN: string;
   TODOIST_API_URL: string;
+  SYNC_METADATA: KVNamespace;
 }
 
 export interface TodoistTask {
@@ -65,4 +66,17 @@ export interface ThingsInboxTask {
   notes: string;
   due: string | null;
   tags: string[];
+}
+
+export interface SyncMetadata {
+  todoistId: string;
+  thingsId: string;
+  lastSynced: string;
+  contentHash?: string;
+}
+
+export interface SyncState {
+  isRunning: boolean;
+  startedAt: string;
+  lastCompletedAt?: string;
 }

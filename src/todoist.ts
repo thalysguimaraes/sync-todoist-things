@@ -1,4 +1,10 @@
-import { Env, TodoistTask, TodoistProject } from './types';
+import { Env, TodoistTask, TodoistProject, SyncMetadata } from './types';
+import { 
+  isSimilarEnough, 
+  extractTodoistIdFromDescription,
+  addThingsIdToNotes,
+  generateContentHash 
+} from './utils';
 
 export class TodoistClient {
   constructor(private env: Env) {}
@@ -108,5 +114,61 @@ export class TodoistClient {
   async findTaskByContent(content: string): Promise<TodoistTask | undefined> {
     const inboxTasks = await this.getInboxTasks(false);
     return inboxTasks.find(task => task.content === content);
+  }
+
+  async findExistingTask(
+    content: string, 
+    thingsId?: string,
+    kv?: KVNamespace
+  ): Promise<{ task: TodoistTask; source: 'exact' | 'fuzzy' | 'metadata' } | null> {
+    const inboxTasks = await this.getInboxTasks(false);
+    
+    // First, check KV store for existing mapping
+    if (kv && thingsId) {
+      const metadata = await kv.get(`mapping:things:${thingsId}`);
+      if (metadata) {
+        const { todoistId } = JSON.parse(metadata) as SyncMetadata;
+        const task = inboxTasks.find(t => t.id === todoistId);
+        if (task) {
+          return { task, source: 'metadata' };
+        }
+      }
+    }
+    
+    // Check for Things ID in task descriptions
+    if (thingsId) {
+      const taskWithThingsId = inboxTasks.find(task => 
+        task.description && task.description.includes(`[things-id:${thingsId}]`)
+      );
+      if (taskWithThingsId) {
+        return { task: taskWithThingsId, source: 'metadata' };
+      }
+    }
+    
+    // Exact match
+    const exactMatch = inboxTasks.find(task => task.content === content);
+    if (exactMatch) {
+      return { task: exactMatch, source: 'exact' };
+    }
+    
+    // Fuzzy match
+    const fuzzyMatch = inboxTasks.find(task => 
+      isSimilarEnough(task.content, content, 0.85)
+    );
+    if (fuzzyMatch) {
+      return { task: fuzzyMatch, source: 'fuzzy' };
+    }
+    
+    return null;
+  }
+
+  async updateTaskWithThingsId(taskId: string, thingsId: string): Promise<void> {
+    const task = await this.request<TodoistTask>(`/tasks/${taskId}`);
+    const updatedDescription = addThingsIdToNotes(task.description || '', thingsId);
+    
+    await this.request(`/tasks/${taskId}`, {
+      method: 'POST',
+      body: JSON.stringify({ description: updatedDescription }),
+    });
   }
 }

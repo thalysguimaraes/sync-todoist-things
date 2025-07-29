@@ -5,4 +5,9 @@ compatibility_date = "2025-07-25"
 [vars]
 TODOIST_API_URL = "https://api.todoist.com/rest/v2"
 
+# KV namespace for storing sync metadata and ID mappings
+[[kv_namespaces]]
+binding = "SYNC_METADATA"
+id = "63e1a66560e24129bfe0915501554381"
+
 # Run `wrangler secret put TODOIST_API_TOKEN` to set your token

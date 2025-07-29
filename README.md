@@ -59,6 +59,10 @@ npm install -g wrangler
 # Login to Cloudflare
 wrangler login
 
+# Create KV namespace for sync metadata
+wrangler kv:namespace create "SYNC_METADATA"
+# Copy the ID from the output and update wrangler.toml with it
+
 # Create the secret for your API token
 wrangler secret put TODOIST_API_TOKEN
 # Paste your Todoist API token when prompted
