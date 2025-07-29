@@ -35,20 +35,17 @@ todoist_mappings=$(echo "$todoist_response" | grep -o '"taskMappings":\[[^]]*\]'
 if [ "$todoist_count" -gt 0 ] 2>/dev/null; then
     log "Found $todoist_count new tasks in Todoist"
     
-    # Open in Things
-    open "$todoist_url"
-    sleep 3  # Give Things time to create the tasks
+    # Get the full task data instead of just URL
+    todoist_tasks=$(curl -s "${WORKER_URL}/inbox?include_all=false")
     
-    # Mark as synced in Todoist
-    curl -s -X POST "${WORKER_URL}/inbox/mark-synced" > /dev/null
-    log "Marked $todoist_count tasks as synced in Todoist"
+    # Import tasks using AppleScript with duplicate prevention
+    import_result=$("${SCRIPT_DIR}/import-todoist-tasks.applescript" "$todoist_tasks" 2>&1)
+    log "Import result: $import_result"
     
-    # Tag tasks in Things if we have mappings
-    if [ -n "$todoist_mappings" ] && [ "$todoist_mappings" != "[]" ]; then
-        log "Tagging imported tasks in Things with existing Todoist IDs"
-        "${SCRIPT_DIR}/tag-things-synced.applescript" "$todoist_mappings" 2>&1 | while read line; do
-            log "Things tagging: $line"
-        done
+    # Mark as synced in Todoist only if import was successful
+    if [[ "$import_result" == *"Imported"* ]]; then
+        curl -s -X POST "${WORKER_URL}/inbox/mark-synced" > /dev/null
+        log "Marked $todoist_count tasks as synced in Todoist"
     fi
 else
     log "No new tasks in Todoist to sync"

@@ -68,10 +68,10 @@ on parseTaskMappings(jsonStr)
     -- Remove brackets and split by },{
     set jsonStr to text 2 thru -2 of jsonStr -- Remove [ and ]
     set AppleScript's text item delimiters to "},{" 
-    set items to text items of jsonStr
+    set jsonItems to text items of jsonStr
     set AppleScript's text item delimiters to ""
     
-    repeat with itemStr in items
+    repeat with itemStr in jsonItems
         -- Clean up the item
         if itemStr starts with "{" then
             set itemStr to text 2 thru -1 of itemStr
