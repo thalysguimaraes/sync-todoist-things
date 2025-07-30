@@ -171,4 +171,16 @@ export class TodoistClient {
       body: JSON.stringify({ description: updatedDescription }),
     });
   }
+
+  async closeTask(taskId: string): Promise<boolean> {
+    try {
+      await this.request(`/tasks/${taskId}/close`, {
+        method: 'POST',
+      });
+      return true;
+    } catch (error) {
+      console.error(`Failed to close task ${taskId}:`, error);
+      return false;
+    }
+  }
 }

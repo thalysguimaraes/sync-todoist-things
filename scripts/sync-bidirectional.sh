@@ -105,6 +105,36 @@ else
     fi
 fi
 
+# STEP 3: Sync completed tasks from Things to Todoist
+log "Step 3: Syncing completed tasks from Things → Todoist"
+
+# Read completed tasks from Things (last 24 hours)
+completed_tasks=$("${SCRIPT_DIR}/read-things-completed.applescript" 2>/dev/null)
+
+if [ $? -ne 0 ] || [ -z "$completed_tasks" ] || [ "$completed_tasks" = "[]" ]; then
+    log "No recently completed tasks in Things to sync"
+else
+    # Count completed tasks
+    completed_count=$(echo "$completed_tasks" | grep -o '"thingsId"' | wc -l | tr -d ' ')
+    log "Found $completed_count recently completed tasks in Things"
+    
+    # Send to Todoist via Worker
+    completion_response=$(curl -s -X POST "${WORKER_URL}/things/sync-completed" \
+        -H "Content-Type: application/json" \
+        -d "$completed_tasks")
+    
+    if [ $? -eq 0 ]; then
+        # Extract summary from response
+        completed=$(echo "$completion_response" | grep -o '"summary":{[^}]*"completed":[0-9]*' | grep -o '"completed":[0-9]*' | cut -d':' -f2)
+        not_found=$(echo "$completion_response" | grep -o '"summary":{[^}]*"notFound":[0-9]*' | grep -o '"notFound":[0-9]*' | cut -d':' -f2)
+        errors=$(echo "$completion_response" | grep -o '"summary":{[^}]*"errors":[0-9]*' | grep -o '"errors":[0-9]*' | cut -d':' -f2)
+        
+        log "Completed tasks sync: $completed marked done, $not_found not found, $errors errors"
+    else
+        log "ERROR: Failed to sync completed tasks from Things to Todoist"
+    fi
+fi
+
 log "Bidirectional sync completed"
 
 # Summary

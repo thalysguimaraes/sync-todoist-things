@@ -80,3 +80,8 @@ export interface SyncState {
   startedAt: string;
   lastCompletedAt?: string;
 }
+
+export interface CompletedTask {
+  thingsId: string;
+  completedAt: string;
+}

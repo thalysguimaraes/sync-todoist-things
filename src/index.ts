@@ -1,4 +1,4 @@
-import { Env, ThingsInboxTask, SyncMetadata } from './types';
+import { Env, ThingsInboxTask, SyncMetadata, CompletedTask } from './types';
 import { TodoistClient } from './todoist';
 import { convertToThingsFormat, generateThingsUrl } from './things';
 import { 
@@ -242,6 +242,92 @@ export default {
           });
         } finally {
           await releaseSyncLock(env.SYNC_METADATA);
+        }
+      }
+
+      if (path === '/things/sync-completed' && request.method === 'POST') {
+        try {
+          // Receive completed tasks from Things
+          const completedTasks = await request.json() as CompletedTask[];
+          
+          const results = await Promise.all(
+            completedTasks.map(async (task) => {
+              try {
+                // Look up the Todoist ID from our KV mapping
+                const metadata = await env.SYNC_METADATA.get(`mapping:things:${task.thingsId}`);
+                
+                if (!metadata) {
+                  return {
+                    thingsId: task.thingsId,
+                    status: 'not_found',
+                    message: 'No Todoist mapping found'
+                  };
+                }
+                
+                const { todoistId } = JSON.parse(metadata) as SyncMetadata;
+                
+                // Close the task in Todoist
+                const success = await todoist.closeTask(todoistId);
+                
+                if (success) {
+                  // Update metadata with completion time
+                  const updatedMetadata: SyncMetadata = {
+                    ...JSON.parse(metadata),
+                    lastSynced: new Date().toISOString()
+                  };
+                  
+                  await env.SYNC_METADATA.put(
+                    `mapping:things:${task.thingsId}`,
+                    JSON.stringify(updatedMetadata)
+                  );
+                  await env.SYNC_METADATA.put(
+                    `mapping:todoist:${todoistId}`,
+                    JSON.stringify(updatedMetadata)
+                  );
+                  
+                  return {
+                    thingsId: task.thingsId,
+                    todoistId,
+                    status: 'completed',
+                    completedAt: task.completedAt
+                  };
+                } else {
+                  return {
+                    thingsId: task.thingsId,
+                    todoistId,
+                    status: 'error',
+                    message: 'Failed to close task in Todoist'
+                  };
+                }
+              } catch (error) {
+                return {
+                  thingsId: task.thingsId,
+                  status: 'error',
+                  message: error instanceof Error ? error.message : 'Unknown error'
+                };
+              }
+            })
+          );
+          
+          const completed = results.filter(r => r.status === 'completed').length;
+          const notFound = results.filter(r => r.status === 'not_found').length;
+          const errors = results.filter(r => r.status === 'error').length;
+          
+          return new Response(JSON.stringify({
+            results,
+            summary: { completed, notFound, errors, total: results.length }
+          }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          console.error('Error syncing completed tasks:', error);
+          return new Response(JSON.stringify({
+            error: 'Failed to sync completed tasks',
+            message: error instanceof Error ? error.message : 'Unknown error'
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
         }
       }
 
