@@ -254,7 +254,39 @@ export default {
             completedTasks.map(async (task) => {
               try {
                 // Look up the Todoist ID from our KV mapping
-                const metadata = await env.SYNC_METADATA.get(`mapping:things:${task.thingsId}`);
+                let metadata = await env.SYNC_METADATA.get(`mapping:things:${task.thingsId}`);
+                
+                // If not found in KV, try to find by extracting Todoist ID from notes
+                if (!metadata) {
+                  try {
+                    const allTasks = await todoist.getInboxTasks(false);
+                    const matchingTask = allTasks.find(t => 
+                      t.description && t.description.includes(`[things-id:${task.thingsId}]`)
+                    );
+                    
+                    if (matchingTask) {
+                      // Create missing metadata entry
+                      const newMetadata: SyncMetadata = {
+                        todoistId: matchingTask.id,
+                        thingsId: task.thingsId,
+                        lastSynced: new Date().toISOString()
+                      };
+                      
+                      await env.SYNC_METADATA.put(
+                        `mapping:things:${task.thingsId}`,
+                        JSON.stringify(newMetadata)
+                      );
+                      await env.SYNC_METADATA.put(
+                        `mapping:todoist:${matchingTask.id}`,
+                        JSON.stringify(newMetadata)
+                      );
+                      
+                      metadata = JSON.stringify(newMetadata);
+                    }
+                  } catch (findError) {
+                    console.error('Error finding task by Things ID:', findError);
+                  }
+                }
                 
                 if (!metadata) {
                   return {
@@ -266,8 +298,17 @@ export default {
                 
                 const { todoistId } = JSON.parse(metadata) as SyncMetadata;
                 
-                // Close the task in Todoist
-                const success = await todoist.closeTask(todoistId);
+                // Close the task in Todoist with retry logic
+                let retryCount = 0;
+                let success = false;
+                
+                while (retryCount < 3 && !success) {
+                  success = await todoist.closeTask(todoistId);
+                  if (!success) {
+                    retryCount++;
+                    await new Promise(resolve => setTimeout(resolve, 1000 * retryCount)); // exponential backoff
+                  }
+                }
                 
                 if (success) {
                   // Update metadata with completion time

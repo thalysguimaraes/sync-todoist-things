@@ -174,12 +174,30 @@ export class TodoistClient {
 
   async closeTask(taskId: string): Promise<boolean> {
     try {
+      // First check if task exists and is not already completed
+      const task = await this.request<TodoistTask>(`/tasks/${taskId}`);
+      
+      if (task.is_completed) {
+        console.log(`Task ${taskId} is already completed`);
+        return true; // Consider already completed as success
+      }
+      
       await this.request(`/tasks/${taskId}/close`, {
         method: 'POST',
       });
       return true;
     } catch (error) {
-      console.error(`Failed to close task ${taskId}:`, error);
+      // More detailed error logging
+      if (error instanceof Error) {
+        console.error(`Failed to close task ${taskId}: ${error.message}`);
+        // If task not found (404), it might have been deleted
+        if (error.message.includes('404')) {
+          console.log(`Task ${taskId} not found, might have been deleted`);
+          return true; // Consider deleted task as successfully "closed"
+        }
+      } else {
+        console.error(`Failed to close task ${taskId}:`, error);
+      }
       return false;
     }
   }

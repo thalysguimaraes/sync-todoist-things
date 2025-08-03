@@ -7,20 +7,20 @@ on run
     set json_output to "["
     set first_item to true
     
-    -- Calculate date 24 hours ago
-    set yesterday to (current date) - (1 * days)
+    -- Calculate date 7 days ago (extended window for more reliable sync)
+    set one_week_ago to (current date) - (7 * days)
     
     tell application "Things3"
         -- Get all completed todos from Logbook
         set completed_todos to to dos of list "Logbook"
         
         repeat with todo_item in completed_todos
-            -- Check if task has the synced-to-todoist tag
+            -- Check if task has either synced tag (bidirectional support)
             set todo_tags to tag names of todo_item
-            if "synced-to-todoist" is in todo_tags then
-                -- Check if completed within last 24 hours
+            if "synced-to-todoist" is in todo_tags or "synced-from-todoist" is in todo_tags then
+                -- Check if completed within last 7 days
                 set completion_date to completion date of todo_item
-                if completion_date is not missing value and completion_date > yesterday then
+                if completion_date is not missing value and completion_date > one_week_ago then
                     -- Build JSON object
                     if not first_item then
                         set json_output to json_output & ","
