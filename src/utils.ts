@@ -1,3 +1,5 @@
+import { TaskFingerprint } from './types';
+
 export function normalizeText(text: string): string {
   return text
     .toLowerCase()
@@ -55,6 +57,49 @@ export async function generateContentHash(content: string, notes?: string): Prom
   const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
   return hashHex.substring(0, 8);
 }
+
+export async function generateRobustHash(title: string, notes?: string, due?: string): Promise<string> {
+  const normalized = {
+    title: normalizeText(title),
+    notes: normalizeText(notes || ''),
+    due: due || ''
+  };
+  
+  const combined = `${normalized.title}|${normalized.notes}|${normalized.due}`;
+  const encoder = new TextEncoder();
+  const data = encoder.encode(combined);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+  return hashHex.substring(0, 12); // Longer hash for better uniqueness
+}
+
+export function generateTitleVariations(title: string): string[] {
+  const normalized = normalizeText(title);
+  const variations = [
+    normalized,
+    title.trim(), // Original with just whitespace trimmed
+    title.trim().toLowerCase(), // Case normalized
+    normalized.replace(/\s+/g, ''), // No spaces
+  ];
+  
+  // Remove duplicates
+  return [...new Set(variations)];
+}
+
+export async function createTaskFingerprint(title: string, notes?: string, due?: string): Promise<TaskFingerprint> {
+  const primaryHash = await generateRobustHash(title, notes, due);
+  const titleVariations = generateTitleVariations(title);
+  const fuzzySearchable = normalizeText(title);
+  
+  return {
+    primaryHash,
+    titleVariations,
+    fuzzySearchable
+  };
+}
+
+
 
 export function extractThingsIdFromNotes(notes: string): string | null {
   const match = notes.match(/\[things-id:([^\]]+)\]/);

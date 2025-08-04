@@ -73,6 +73,22 @@ export interface SyncMetadata {
   thingsId: string;
   lastSynced: string;
   contentHash?: string;
+  robustHash?: string;
+  fingerprint?: TaskFingerprint;
+}
+
+export interface TaskFingerprint {
+  primaryHash: string;
+  titleVariations: string[];
+  fuzzySearchable: string;
+}
+
+export interface TaskMapping {
+  todoistId: string;
+  thingsId: string;
+  fingerprint: TaskFingerprint;
+  lastSynced: string;
+  source: 'exact' | 'fuzzy' | 'hash' | 'legacy';
 }
 
 export interface SyncState {

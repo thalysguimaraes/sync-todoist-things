@@ -1,4 +1,4 @@
-import { Env, ThingsInboxTask, SyncMetadata, CompletedTask } from './types';
+import { Env, ThingsInboxTask, SyncMetadata, CompletedTask, TaskMapping } from './types';
 import { TodoistClient } from './todoist';
 import { convertToThingsFormat, generateThingsUrl } from './things';
 import { 
@@ -6,7 +6,8 @@ import {
   releaseSyncLock, 
   generateContentHash,
   extractThingsIdFromNotes,
-  addThingsIdToNotes 
+  addThingsIdToNotes,
+  createTaskFingerprint
 } from './utils';
 
 export default {
@@ -30,7 +31,7 @@ export default {
       if (path === '/inbox' && request.method === 'GET') {
         // Get tasks, excluding already synced ones by default
         const includeAll = url.searchParams.get('include_all') === 'true';
-        const tasks = await todoist.getInboxTasks(!includeAll);
+        const tasks = await todoist.getInboxTasks(!includeAll, env.SYNC_METADATA);
         
         // Enhance tasks with Things IDs from descriptions
         const enhancedTasks = tasks.map(task => {
@@ -64,16 +65,45 @@ export default {
       }
 
       if (path === '/inbox/mark-synced' && request.method === 'POST') {
-        // Mark tasks as synced without deleting them
-        const tasks = await todoist.getInboxTasks(true); // Get unsynced tasks
-        
-        // Ensure the label exists
-        await todoist.createLabelIfNotExists('synced-to-things');
+        // Mark tasks as synced using fingerprint-based tracking
+        const tasks = await todoist.getInboxTasks(true, env.SYNC_METADATA); // Get unsynced tasks
         
         const results = await Promise.all(
           tasks.map(async (task) => {
             try {
-              await todoist.addLabelToTask(task.id, 'synced-to-things');
+              // Create fingerprint for the task
+              const fingerprint = await createTaskFingerprint(task.content, task.description);
+              
+              // Create a mapping to mark it as synced to Things (placeholder thingsId)
+              const taskMapping: TaskMapping = {
+                todoistId: task.id,
+                thingsId: `manual-sync-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+                fingerprint,
+                lastSynced: new Date().toISOString(),
+                source: 'exact'
+              };
+              
+              // Store the mapping
+              await env.SYNC_METADATA.put(
+                `hash:${fingerprint.primaryHash}`,
+                JSON.stringify(taskMapping)
+              );
+              
+              // Also store legacy mapping for backward compatibility
+              const legacyMetadata: SyncMetadata = {
+                todoistId: task.id,
+                thingsId: taskMapping.thingsId,
+                lastSynced: new Date().toISOString(),
+                contentHash: await generateContentHash(task.content, task.description),
+                robustHash: fingerprint.primaryHash,
+                fingerprint
+              };
+              
+              await env.SYNC_METADATA.put(
+                `mapping:todoist:${task.id}`,
+                JSON.stringify(legacyMetadata)
+              );
+              
               return { id: task.id, content: task.content, status: 'marked_synced' };
             } catch (error) {
               return { id: task.id, status: 'error', message: error instanceof Error ? error.message : 'Unknown error' };
@@ -87,8 +117,8 @@ export default {
       }
 
       if (path === '/inbox/clear' && request.method === 'POST') {
-        const tasks = await todoist.getInboxTasks(false); // Get all tasks including synced
-        const deleteMode = url.searchParams.get('mode') || 'label'; // Default to label mode
+        const tasks = await todoist.getInboxTasks(false, env.SYNC_METADATA); // Get all tasks including synced
+        const deleteMode = url.searchParams.get('mode') || 'fingerprint'; // Default to fingerprint mode
         
         const results = await Promise.all(
           tasks.map(async (task) => {
@@ -96,10 +126,25 @@ export default {
               if (deleteMode === 'delete') {
                 await todoist.deleteTask(task.id);
                 return { id: task.id, status: 'deleted' };
-              } else if (deleteMode === 'label') {
-                await todoist.addLabelToTask(task.id, 'synced-to-things');
-                return { id: task.id, status: 'labeled' };
-              } else {
+              } else if (deleteMode === 'fingerprint') {
+                // Mark as synced using fingerprint tracking
+                const fingerprint = await createTaskFingerprint(task.content, task.description);
+                
+                const taskMapping: TaskMapping = {
+                  todoistId: task.id,
+                  thingsId: `cleared-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+                  fingerprint,
+                  lastSynced: new Date().toISOString(),
+                  source: 'exact'
+                };
+                
+                await env.SYNC_METADATA.put(
+                  `hash:${fingerprint.primaryHash}`,
+                  JSON.stringify(taskMapping)
+                );
+                
+                return { id: task.id, status: 'marked_synced' };
+              } else if (deleteMode === 'move') {
                 const projects = await todoist.getProjects();
                 let syncedProject = projects.find(p => p.name === 'Synced to Things');
                 
@@ -109,6 +154,10 @@ export default {
                 
                 await todoist.moveTaskToProject(task.id, syncedProject.id);
                 return { id: task.id, status: 'moved' };
+              } else {
+                // Legacy label mode for backward compatibility
+                await todoist.addLabelToTask(task.id, 'synced-to-things');
+                return { id: task.id, status: 'labeled' };
               }
             } catch (error) {
               return { id: task.id, status: 'error', message: error instanceof Error ? error.message : 'Unknown error' };
@@ -138,79 +187,112 @@ export default {
           // Receive tasks from Things and sync to Todoist
           const thingsTasks = await request.json() as ThingsInboxTask[];
           
-          // Ensure labels exist
-          await todoist.createLabelIfNotExists('synced-from-things');
-          
           const results = await Promise.all(
             thingsTasks.map(async (task) => {
               try {
-                // Check if task already exists using enhanced deduplication
-                const existingResult = await todoist.findExistingTask(
+                // Check if task already exists using enhanced fingerprint deduplication
+                const existingMapping = await todoist.findExistingTaskByFingerprint(
                   task.title,
+                  task.notes,
+                  task.due,
                   task.id,
                   env.SYNC_METADATA
                 );
                 
-                if (existingResult) {
-                  // Update metadata if needed
-                  const metadata: SyncMetadata = {
-                    todoistId: existingResult.task.id,
+                if (existingMapping) {
+                  // Create fingerprint and store updated mapping
+                  const fingerprint = await createTaskFingerprint(task.title, task.notes, task.due);
+                  
+                  const updatedMapping: TaskMapping = {
+                    todoistId: existingMapping.todoistId,
+                    thingsId: task.id,
+                    fingerprint,
+                    lastSynced: new Date().toISOString(),
+                    source: existingMapping.source
+                  };
+                  
+                  // Store by fingerprint hash (new method)
+                  await env.SYNC_METADATA.put(
+                    `hash:${fingerprint.primaryHash}`,
+                    JSON.stringify(updatedMapping)
+                  );
+                  
+                  // Keep legacy mappings for backward compatibility during transition
+                  const legacyMetadata: SyncMetadata = {
+                    todoistId: existingMapping.todoistId,
                     thingsId: task.id,
                     lastSynced: new Date().toISOString(),
-                    contentHash: await generateContentHash(task.title, task.notes)
+                    contentHash: await generateContentHash(task.title, task.notes),
+                    robustHash: fingerprint.primaryHash,
+                    fingerprint
                   };
                   
                   await env.SYNC_METADATA.put(
                     `mapping:things:${task.id}`,
-                    JSON.stringify(metadata)
+                    JSON.stringify(legacyMetadata)
                   );
                   await env.SYNC_METADATA.put(
-                    `mapping:todoist:${existingResult.task.id}`,
-                    JSON.stringify(metadata)
+                    `mapping:todoist:${existingMapping.todoistId}`,
+                    JSON.stringify(legacyMetadata)
                   );
                   
                   return { 
                     id: task.id, 
                     title: task.title, 
                     status: 'already_exists',
-                    match_type: existingResult.source,
-                    todoist_id: existingResult.task.id 
+                    match_type: existingMapping.source,
+                    todoist_id: existingMapping.todoistId 
                   };
                 }
                 
-                // Create new task in Todoist with Things ID in description
-                const labels = ['synced-from-things'];
+                // Create new task in Todoist (clean, no labels for sync tracking)
+                const taskLabels: string[] = [];
                 if (task.tags && task.tags.length > 0) {
-                  labels.push(...task.tags);
+                  // Only add actual user tags, not sync tracking labels
+                  taskLabels.push(...task.tags);
                 }
-                
-                const descriptionWithId = addThingsIdToNotes(
-                  task.notes || '',
-                  task.id
-                );
                 
                 const newTask = await todoist.createTask({
                   content: task.title,
-                  description: descriptionWithId,
+                  description: task.notes || '',
                   due_date: task.due || undefined,
-                  labels,
+                  labels: taskLabels,
                 });
                 
-                // Store mapping in KV
-                const metadata: SyncMetadata = {
+                // Create fingerprint for the new task
+                const fingerprint = await createTaskFingerprint(task.title, task.notes, task.due);
+                
+                // Store mapping using new fingerprint method
+                const taskMapping: TaskMapping = {
+                  todoistId: newTask.id,
+                  thingsId: task.id,
+                  fingerprint,
+                  lastSynced: new Date().toISOString(),
+                  source: 'exact'
+                };
+                
+                await env.SYNC_METADATA.put(
+                  `hash:${fingerprint.primaryHash}`,
+                  JSON.stringify(taskMapping)
+                );
+                
+                // Keep legacy mappings for backward compatibility
+                const legacyMetadata: SyncMetadata = {
                   todoistId: newTask.id,
                   thingsId: task.id,
                   lastSynced: new Date().toISOString(),
-                  contentHash: generateContentHash(task.title, task.notes)
+                  contentHash: await generateContentHash(task.title, task.notes),
+                  robustHash: fingerprint.primaryHash,
+                  fingerprint
                 };
                 
                 await env.SYNC_METADATA.put(
                   `mapping:things:${task.id}`,
-                  JSON.stringify(metadata)
+                  JSON.stringify(legacyMetadata)
                 );
                 await env.SYNC_METADATA.put(
                   `mapping:todoist:${newTask.id}`,
-                  JSON.stringify(metadata)
+                  JSON.stringify(legacyMetadata)
                 );
                 
                 return { 
@@ -259,7 +341,7 @@ export default {
                 // If not found in KV, try to find by extracting Todoist ID from notes
                 if (!metadata) {
                   try {
-                    const allTasks = await todoist.getInboxTasks(false);
+                    const allTasks = await todoist.getInboxTasks(false, env.SYNC_METADATA);
                     const matchingTask = allTasks.find(t => 
                       t.description && t.description.includes(`[things-id:${task.thingsId}]`)
                     );
