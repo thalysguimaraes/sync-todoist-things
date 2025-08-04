@@ -12,7 +12,7 @@ import {
 export class TodoistClient {
   constructor(private env: Env) {}
 
-  private async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+  async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
     const response = await fetch(`${this.env.TODOIST_API_URL}${endpoint}`, {
       ...options,
       headers: {
