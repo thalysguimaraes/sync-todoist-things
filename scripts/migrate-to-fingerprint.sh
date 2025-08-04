@@ -114,6 +114,29 @@ if echo "$migration_response" | jq -e '.summary[]' > /dev/null; then
     echo
 fi
 
+# Clean up old sync tags from migrated tasks
+log_color "🧹 Cleaning up old sync tags..." "$YELLOW"
+cleanup_response=$(curl -s -X POST "$WORKER_URL/cleanup-tags")
+cleanup_exit_code=$?
+
+if [ $cleanup_exit_code -eq 0 ] && ! echo "$cleanup_response" | jq -e '.error' > /dev/null; then
+    cleanup_processed=$(echo "$cleanup_response" | jq -r '.processed')
+    cleanup_cleaned=$(echo "$cleanup_response" | jq -r '.cleaned')
+    cleanup_errors=$(echo "$cleanup_response" | jq -r '.errors')
+    
+    log_color "✅ Tag cleanup completed!" "$GREEN"
+    echo "   • Processed: $cleanup_processed tasks"
+    echo "   • Cleaned: $cleanup_cleaned tasks"
+    echo "   • Errors: $cleanup_errors"
+    echo
+else
+    log_color "⚠️  Tag cleanup failed or had issues" "$YELLOW"
+    if echo "$cleanup_response" | jq -e '.error' > /dev/null; then
+        echo "$cleanup_response" | jq -r '.message'
+    fi
+    echo
+fi
+
 # Get post-migration status
 log_color "📊 Getting post-migration status..." "$BLUE"
 sleep 2  # Give system time to settle

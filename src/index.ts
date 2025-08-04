@@ -561,7 +561,7 @@ export default {
             try {
               // Check if already migrated
               const fingerprint = await createTaskFingerprint(task.content, task.description);
-              const existing = await env.SYNC_METADATA.get(`hash:${fingerprint.primaryHash}`);
+              let existing = await env.SYNC_METADATA.get(`hash:${fingerprint.primaryHash}`);
               
               if (!existing) {
                 // Create new fingerprint mapping
@@ -580,6 +580,24 @@ export default {
 
                 results.todoistTasks.migrated++;
                 results.summary.push(`Migrated Todoist task: ${task.content.substring(0, 50)}...`);
+                existing = JSON.stringify(taskMapping);
+              }
+
+              // Remove old sync labels from the task (clean up UI)
+              if (existing) {
+                const currentLabels = task.labels.filter(label => 
+                  label !== 'synced-to-things' && 
+                  label !== 'synced-from-things'
+                );
+
+                // Only update if labels changed
+                if (currentLabels.length !== task.labels.length) {
+                  await todoist.request(`/tasks/${task.id}`, {
+                    method: 'POST',
+                    body: JSON.stringify({ labels: currentLabels }),
+                  });
+                  results.summary.push(`Cleaned tags from: ${task.content.substring(0, 40)}...`);
+                }
               }
             } catch (error) {
               results.todoistTasks.errors++;
@@ -660,6 +678,71 @@ export default {
         } catch (error) {
           return new Response(JSON.stringify({
             error: 'Migration failed',
+            message: error instanceof Error ? error.message : 'Unknown error'
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      if (path === '/cleanup-tags' && request.method === 'POST') {
+        // Clean up sync tags from tasks that are already migrated to fingerprint system
+        try {
+          const results = {
+            processed: 0,
+            cleaned: 0,
+            errors: 0,
+            summary: []
+          };
+
+          // Get all tasks with sync tags
+          const allTasks = await todoist.getInboxTasks(false); // Get all tasks
+          const taggedTasks = allTasks.filter(task => 
+            task.labels.includes('synced-to-things') || 
+            task.labels.includes('synced-from-things')
+          );
+
+          for (const task of taggedTasks) {
+            results.processed++;
+            try {
+              // Check if task is already in fingerprint system
+              const fingerprint = await createTaskFingerprint(task.content, task.description);
+              const existing = await env.SYNC_METADATA.get(`hash:${fingerprint.primaryHash}`);
+              
+              if (existing) {
+                // Remove sync labels since task is tracked by fingerprint
+                const cleanLabels = task.labels.filter(label => 
+                  label !== 'synced-to-things' && 
+                  label !== 'synced-from-things'
+                );
+
+                if (cleanLabels.length !== task.labels.length) {
+                  await todoist.request(`/tasks/${task.id}`, {
+                    method: 'POST',
+                    body: JSON.stringify({ labels: cleanLabels }),
+                  });
+
+                  results.cleaned++;
+                  results.summary.push(`Cleaned: ${task.content.substring(0, 50)}...`);
+                } else {
+                  results.summary.push(`No tags to clean: ${task.content.substring(0, 40)}...`);
+                }
+              } else {
+                results.summary.push(`Not migrated yet: ${task.content.substring(0, 40)}...`);
+              }
+            } catch (error) {
+              results.errors++;
+              results.summary.push(`Error cleaning ${task.id}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+            }
+          }
+
+          return new Response(JSON.stringify(results), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({
+            error: 'Tag cleanup failed',
             message: error instanceof Error ? error.message : 'Unknown error'
           }), {
             status: 500,
