@@ -751,6 +751,92 @@ export default {
         }
       }
 
+      if (path === '/debug/mappings' && request.method === 'GET') {
+        // Debug endpoint to analyze fingerprint mappings and detect issues
+        try {
+          const results = {
+            hashMappings: [],
+            legacyMappings: [],
+            todoistTasks: [],
+            analysis: {
+              duplicateFingerprints: [],
+              orphanedMappings: [],
+              tasksWithoutMappings: []
+            }
+          };
+
+          // Get all hash-based mappings
+          const hashList = await env.SYNC_METADATA.list({ prefix: 'hash:' });
+          for (const key of hashList.keys) {
+            const mapping = await env.SYNC_METADATA.get(key.name);
+            if (mapping) {
+              const taskMapping = JSON.parse(mapping) as TaskMapping;
+              results.hashMappings.push({
+                hash: key.name.replace('hash:', ''),
+                ...taskMapping
+              });
+            }
+          }
+
+          // Get all legacy mappings
+          const legacyList = await env.SYNC_METADATA.list({ prefix: 'mapping:' });
+          for (const key of legacyList.keys) {
+            const mapping = await env.SYNC_METADATA.get(key.name);
+            if (mapping) {
+              const syncMetadata = JSON.parse(mapping) as SyncMetadata;
+              results.legacyMappings.push({
+                key: key.name,
+                ...syncMetadata
+              });
+            }
+          }
+
+          // Get all current Todoist tasks
+          const allTasks = await todoist.getInboxTasks(false, env.SYNC_METADATA);
+          for (const task of allTasks) {
+            const fingerprint = await createTaskFingerprint(task.content, task.description);
+            results.todoistTasks.push({
+              id: task.id,
+              title: task.content,
+              description: task.description || '',
+              labels: task.labels,
+              fingerprint: fingerprint.primaryHash,
+              hasMapping: results.hashMappings.some(m => m.todoistId === task.id)
+            });
+          }
+
+          // Analysis: Find tasks without mappings
+          results.analysis.tasksWithoutMappings = results.todoistTasks.filter(t => !t.hasMapping);
+
+          // Analysis: Find orphaned mappings (mappings without corresponding tasks)
+          results.analysis.orphanedMappings = results.hashMappings.filter(m => 
+            !results.todoistTasks.some(t => t.id === m.todoistId)
+          );
+
+          // Analysis: Find duplicate fingerprints
+          const fingerprintCounts = {};
+          results.hashMappings.forEach(m => {
+            fingerprintCounts[m.fingerprint.primaryHash] = (fingerprintCounts[m.fingerprint.primaryHash] || 0) + 1;
+          });
+          
+          results.analysis.duplicateFingerprints = Object.entries(fingerprintCounts)
+            .filter(([hash, count]) => count > 1)
+            .map(([hash, count]) => ({ hash, count }));
+
+          return new Response(JSON.stringify(results, null, 2), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({
+            error: 'Debug analysis failed',
+            message: error instanceof Error ? error.message : 'Unknown error'
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
       if (path === '/health' && request.method === 'GET') {
         return new Response(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString() }), {
           headers: { ...corsHeaders, 'Content-Type': 'application/json' },
