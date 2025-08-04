@@ -459,22 +459,213 @@ export default {
         const lockData = await env.SYNC_METADATA.get(lockKey);
         const isLocked = lockData ? JSON.parse(lockData).timestamp > Date.now() - 30000 : false;
         
-        // Get some stats
+        // Get comprehensive stats
         const mappingsList = await env.SYNC_METADATA.list({ prefix: 'mapping:' });
+        const hashList = await env.SYNC_METADATA.list({ prefix: 'hash:' });
+        
         const thingsMappings = mappingsList.keys.filter(k => k.name.startsWith('mapping:things:')).length;
         const todoistMappings = mappingsList.keys.filter(k => k.name.startsWith('mapping:todoist:')).length;
         
+        // Analyze migration status
+        let migratedMappings = 0;
+        let pendingMigration = 0;
+        
+        for (const key of mappingsList.keys) {
+          try {
+            const metadata = await env.SYNC_METADATA.get(key.name);
+            if (metadata) {
+              const syncMetadata = JSON.parse(metadata) as SyncMetadata;
+              if (syncMetadata.fingerprint && syncMetadata.robustHash) {
+                migratedMappings++;
+              } else {
+                pendingMigration++;
+              }
+            }
+          } catch (error) {
+            // Skip invalid entries
+          }
+        }
+
+        // Check Todoist tasks with sync labels
+        const allTasks = await todoist.getInboxTasks(false, env.SYNC_METADATA);
+        const taggedTasks = allTasks.filter(task => 
+          task.labels.includes('synced-to-things') || 
+          task.labels.includes('synced-from-things')
+        );
+
+        let taggedTasksWithFingerprints = 0;
+        for (const task of taggedTasks) {
+          try {
+            const fingerprint = await createTaskFingerprint(task.content, task.description);
+            const hashMapping = await env.SYNC_METADATA.get(`hash:${fingerprint.primaryHash}`);
+            if (hashMapping) {
+              taggedTasksWithFingerprints++;
+            }
+          } catch (error) {
+            // Skip errors
+          }
+        }
+        
         return new Response(JSON.stringify({ 
           syncLocked: isLocked,
-          mappings: {
-            things: thingsMappings,
-            todoist: todoistMappings,
-            total: mappingsList.keys.length
+          legacy: {
+            mappings: {
+              things: thingsMappings,
+              todoist: todoistMappings,
+              total: mappingsList.keys.length
+            },
+            taggedTasks: {
+              total: taggedTasks.length,
+              withFingerprints: taggedTasksWithFingerprints,
+              pendingMigration: taggedTasks.length - taggedTasksWithFingerprints
+            }
+          },
+          fingerprint: {
+            hashMappings: hashList.keys.length,
+            migratedLegacyMappings: migratedMappings,
+            pendingLegacyMigration: pendingMigration
+          },
+          migration: {
+            progress: mappingsList.keys.length > 0 ? (migratedMappings / mappingsList.keys.length * 100).toFixed(1) + '%' : '0%',
+            isComplete: pendingMigration === 0 && (taggedTasks.length - taggedTasksWithFingerprints) === 0,
+            recommendations: [
+              ...(pendingMigration > 0 ? ['Run POST /migrate to migrate legacy mappings'] : []),
+              ...((taggedTasks.length - taggedTasksWithFingerprints) > 0 ? ['Run POST /migrate to migrate tagged tasks'] : []),
+              ...(pendingMigration === 0 && (taggedTasks.length - taggedTasksWithFingerprints) === 0 ? ['Migration complete! System ready for tag-free operation'] : [])
+            ]
           },
           timestamp: new Date().toISOString()
         }), {
           headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         });
+      }
+
+      if (path === '/migrate' && request.method === 'POST') {
+        // Migrate existing tag-based tasks to fingerprint system
+        try {
+          const results = {
+            todoistTasks: { processed: 0, migrated: 0, errors: 0 },
+            legacyMappings: { processed: 0, migrated: 0, errors: 0 },
+            summary: []
+          };
+
+          // 1. Migrate Todoist tasks with sync labels
+          const allTasks = await todoist.getInboxTasks(false); // Get all tasks
+          const taggedTasks = allTasks.filter(task => 
+            task.labels.includes('synced-to-things') || 
+            task.labels.includes('synced-from-things')
+          );
+
+          for (const task of taggedTasks) {
+            results.todoistTasks.processed++;
+            try {
+              // Check if already migrated
+              const fingerprint = await createTaskFingerprint(task.content, task.description);
+              const existing = await env.SYNC_METADATA.get(`hash:${fingerprint.primaryHash}`);
+              
+              if (!existing) {
+                // Create new fingerprint mapping
+                const taskMapping: TaskMapping = {
+                  todoistId: task.id,
+                  thingsId: `migrated-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+                  fingerprint,
+                  lastSynced: new Date().toISOString(),
+                  source: 'legacy'
+                };
+
+                await env.SYNC_METADATA.put(
+                  `hash:${fingerprint.primaryHash}`,
+                  JSON.stringify(taskMapping)
+                );
+
+                results.todoistTasks.migrated++;
+                results.summary.push(`Migrated Todoist task: ${task.content.substring(0, 50)}...`);
+              }
+            } catch (error) {
+              results.todoistTasks.errors++;
+              results.summary.push(`Error migrating Todoist task ${task.id}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+            }
+          }
+
+          // 2. Migrate existing KV mappings to new format
+          const mappingsList = await env.SYNC_METADATA.list({ prefix: 'mapping:' });
+          
+          for (const key of mappingsList.keys) {
+            results.legacyMappings.processed++;
+            try {
+              const metadata = await env.SYNC_METADATA.get(key.name);
+              if (!metadata) continue;
+
+              const syncMetadata = JSON.parse(metadata) as SyncMetadata;
+              
+              // Skip if already has fingerprint
+              if (syncMetadata.fingerprint && syncMetadata.robustHash) {
+                continue;
+              }
+
+              // Get task details to create fingerprint
+              let taskContent = '';
+              let taskDescription = '';
+              
+              if (key.name.startsWith('mapping:todoist:')) {
+                const task = allTasks.find(t => t.id === syncMetadata.todoistId);
+                if (task) {
+                  taskContent = task.content;
+                  taskDescription = task.description || '';
+                }
+              }
+
+              if (taskContent) {
+                const fingerprint = await createTaskFingerprint(taskContent, taskDescription);
+                
+                // Check if hash mapping already exists
+                const hashMapping = await env.SYNC_METADATA.get(`hash:${fingerprint.primaryHash}`);
+                
+                if (!hashMapping) {
+                  const taskMapping: TaskMapping = {
+                    todoistId: syncMetadata.todoistId,
+                    thingsId: syncMetadata.thingsId,
+                    fingerprint,
+                    lastSynced: syncMetadata.lastSynced,
+                    source: 'legacy'
+                  };
+
+                  await env.SYNC_METADATA.put(
+                    `hash:${fingerprint.primaryHash}`,
+                    JSON.stringify(taskMapping)
+                  );
+
+                  // Update legacy mapping with fingerprint info
+                  const updatedMetadata: SyncMetadata = {
+                    ...syncMetadata,
+                    robustHash: fingerprint.primaryHash,
+                    fingerprint
+                  };
+
+                  await env.SYNC_METADATA.put(key.name, JSON.stringify(updatedMetadata));
+
+                  results.legacyMappings.migrated++;
+                  results.summary.push(`Migrated legacy mapping: ${key.name}`);
+                }
+              }
+            } catch (error) {
+              results.legacyMappings.errors++;
+              results.summary.push(`Error migrating ${key.name}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+            }
+          }
+
+          return new Response(JSON.stringify(results), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({
+            error: 'Migration failed',
+            message: error instanceof Error ? error.message : 'Unknown error'
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
       }
 
       if (path === '/health' && request.method === 'GET') {
