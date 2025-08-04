@@ -1,9 +1,12 @@
-import { Env, TodoistTask, TodoistProject, SyncMetadata } from './types';
+import { Env, TodoistTask, TodoistProject, SyncMetadata, TaskMapping, TaskFingerprint } from './types';
 import { 
   isSimilarEnough, 
   extractTodoistIdFromDescription,
   addThingsIdToNotes,
-  generateContentHash 
+  generateContentHash,
+  createTaskFingerprint,
+  generateRobustHash,
+  generateTitleVariations
 } from './utils';
 
 export class TodoistClient {
@@ -35,7 +38,7 @@ export class TodoistClient {
     return projects.find(p => p.is_inbox_project);
   }
 
-  async getInboxTasks(excludeSynced: boolean = true): Promise<TodoistTask[]> {
+  async getInboxTasks(excludeSynced: boolean = true, kv?: KVNamespace): Promise<TodoistTask[]> {
     const inboxProject = await this.getInboxProject();
     if (!inboxProject) {
       throw new Error('Inbox project not found');
@@ -44,8 +47,29 @@ export class TodoistClient {
     const tasks = await this.request<TodoistTask[]>(`/tasks?project_id=${inboxProject.id}`);
     let activeTasks = tasks.filter(task => !task.is_completed);
     
-    // Optionally exclude tasks already synced to Things
-    if (excludeSynced) {
+    // If fingerprint-based exclusion is requested and KV is available
+    if (excludeSynced && kv) {
+      const syncedTasks = new Set<string>();
+      
+      // Check KV for synced tasks using new hash-based system
+      for (const task of activeTasks) {
+        const fingerprint = await createTaskFingerprint(task.content, task.description);
+        const mapping = await kv.get(`hash:${fingerprint.primaryHash}`);
+        if (mapping) {
+          syncedTasks.add(task.id);
+          continue;
+        }
+        
+        // Legacy check: look for tasks in mapping by Todoist ID
+        const legacyMapping = await kv.get(`mapping:todoist:${task.id}`);
+        if (legacyMapping) {
+          syncedTasks.add(task.id);
+        }
+      }
+      
+      activeTasks = activeTasks.filter(task => !syncedTasks.has(task.id));
+    } else if (excludeSynced && !kv) {
+      // Fallback to label-based filtering for backward compatibility
       activeTasks = activeTasks.filter(task => !task.labels.includes('synced-to-things'));
     }
     
@@ -111,55 +135,120 @@ export class TodoistClient {
     });
   }
 
-  async findTaskByContent(content: string): Promise<TodoistTask | undefined> {
-    const inboxTasks = await this.getInboxTasks(false);
+  async findTaskByContent(content: string, kv?: KVNamespace): Promise<TodoistTask | undefined> {
+    const inboxTasks = await this.getInboxTasks(false, kv);
     return inboxTasks.find(task => task.content === content);
   }
 
-  async findExistingTask(
-    content: string, 
+  async findExistingTaskByFingerprint(
+    title: string,
+    notes?: string,
+    due?: string,
     thingsId?: string,
     kv?: KVNamespace
-  ): Promise<{ task: TodoistTask; source: 'exact' | 'fuzzy' | 'metadata' } | null> {
-    const inboxTasks = await this.getInboxTasks(false);
-    
-    // First, check KV store for existing mapping
-    if (kv && thingsId) {
-      const metadata = await kv.get(`mapping:things:${thingsId}`);
-      if (metadata) {
-        const { todoistId } = JSON.parse(metadata) as SyncMetadata;
-        const task = inboxTasks.find(t => t.id === todoistId);
-        if (task) {
-          return { task, source: 'metadata' };
-        }
+  ): Promise<TaskMapping | null> {
+    if (!kv) return null;
+
+    // Create fingerprint for the incoming task
+    const fingerprint = await createTaskFingerprint(title, notes, due);
+
+    // 1. Try exact hash lookup first (fastest)
+    let mapping = await kv.get(`hash:${fingerprint.primaryHash}`);
+    if (mapping) {
+      const taskMapping = JSON.parse(mapping) as TaskMapping;
+      return { ...taskMapping, source: 'hash' };
+    }
+
+    // 2. Check legacy mapping by Things ID
+    if (thingsId) {
+      const legacyMapping = await kv.get(`mapping:things:${thingsId}`);
+      if (legacyMapping) {
+        const metadata = JSON.parse(legacyMapping) as SyncMetadata;
+        return {
+          todoistId: metadata.todoistId,
+          thingsId: metadata.thingsId,
+          fingerprint,
+          lastSynced: metadata.lastSynced,
+          source: 'legacy'
+        };
       }
     }
+
+    // 3. Try title variations
+    for (const titleVariation of fingerprint.titleVariations) {
+      const variationHash = await generateRobustHash(titleVariation, notes, due);
+      mapping = await kv.get(`hash:${variationHash}`);
+      if (mapping) {
+        const taskMapping = JSON.parse(mapping) as TaskMapping;
+        return { ...taskMapping, source: 'fuzzy' };
+      }
+    }
+
+    // 4. Fallback: scan for tasks with similar content (expensive, but thorough)
+    const inboxTasks = await this.getInboxTasks(false, kv);
     
-    // Check for Things ID in task descriptions
+    // Check for Things ID in descriptions (legacy support)
     if (thingsId) {
       const taskWithThingsId = inboxTasks.find(task => 
         task.description && task.description.includes(`[things-id:${thingsId}]`)
       );
       if (taskWithThingsId) {
-        return { task: taskWithThingsId, source: 'metadata' };
+        return {
+          todoistId: taskWithThingsId.id,
+          thingsId: thingsId,
+          fingerprint,
+          lastSynced: new Date().toISOString(),
+          source: 'legacy'
+        };
       }
     }
-    
-    // Exact match
-    const exactMatch = inboxTasks.find(task => task.content === content);
+
+    // Exact title match
+    const exactMatch = inboxTasks.find(task => task.content === title);
     if (exactMatch) {
-      return { task: exactMatch, source: 'exact' };
+      return {
+        todoistId: exactMatch.id,
+        thingsId: thingsId || '',
+        fingerprint,
+        lastSynced: new Date().toISOString(),
+        source: 'exact'
+      };
     }
-    
-    // Fuzzy match
+
+    // Fuzzy title match
     const fuzzyMatch = inboxTasks.find(task => 
-      isSimilarEnough(task.content, content, 0.85)
+      isSimilarEnough(task.content, title, 0.85)
     );
     if (fuzzyMatch) {
-      return { task: fuzzyMatch, source: 'fuzzy' };
+      return {
+        todoistId: fuzzyMatch.id,
+        thingsId: thingsId || '',
+        fingerprint,
+        lastSynced: new Date().toISOString(),
+        source: 'fuzzy'
+      };
     }
-    
+
     return null;
+  }
+
+  // Keep the old method for backward compatibility during transition
+  async findExistingTask(
+    content: string, 
+    thingsId?: string,
+    kv?: KVNamespace
+  ): Promise<{ task: TodoistTask; source: 'exact' | 'fuzzy' | 'metadata' } | null> {
+    const mapping = await this.findExistingTaskByFingerprint(content, '', '', thingsId, kv);
+    if (!mapping) return null;
+
+    const inboxTasks = await this.getInboxTasks(false, kv);
+    const task = inboxTasks.find(t => t.id === mapping.todoistId);
+    if (!task) return null;
+
+    return { 
+      task, 
+      source: mapping.source === 'hash' ? 'metadata' : mapping.source 
+    };
   }
 
   async updateTaskWithThingsId(taskId: string, thingsId: string): Promise<void> {
