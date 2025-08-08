@@ -2,7 +2,7 @@ import { Env } from './types';
 
 export interface SyncMetric {
   timestamp: string;
-  type: 'inbox_fetch' | 'things_sync' | 'completed_sync' | 'bulk_sync' | 'mark_synced';
+  type: 'inbox_fetch' | 'things_sync' | 'completed_sync' | 'bulk_sync' | 'mark_synced' | 'webhook_processed' | 'cron_sync' | 'sync_coordination' | 'sync_response';
   success: boolean;
   duration: number;
   details: {
@@ -15,6 +15,13 @@ export interface SyncMetric {
     direction?: string;
     conflictsDetected?: number;
     conflictsResolved?: number;
+    eventType?: string;
+    deliveryId?: string;
+    responseType?: string;
+    cronPattern?: string;
+    scheduledTime?: string;
+    tasksFound?: number;
+    requestId?: string;
   };
   errorMessage?: string;
 }

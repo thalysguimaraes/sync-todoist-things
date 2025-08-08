@@ -5,6 +5,11 @@ export interface Env {
   REPAIR_AUTH_TOKEN?: string;
 }
 
+export interface ScheduledEvent {
+  scheduledTime: number;
+  cron: string;
+}
+
 export interface TodoistTask {
   id: string;
   project_id: string;

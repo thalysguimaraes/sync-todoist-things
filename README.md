@@ -13,6 +13,9 @@ A powerful Cloudflare Worker that enables automatic bidirectional synchronizatio
 - **📊 Performance Metrics**: Track sync performance and monitor health
 - **⚡ Idempotency**: Safe request retry with automatic deduplication
 - **🔧 Configuration API**: Customize sync behavior via REST API
+- **🪝 Webhook Integration**: Real-time sync from GitHub, Notion, Slack, and custom services
+- **📡 Outbound Webhooks**: Get notified of sync events in real-time
+- **⏰ CF Workers Cron**: Server-side sync coordination running every 2 minutes
 - **🚀 Easy Setup**: Automated setup wizard for quick deployment
 - **📝 Comprehensive Testing**: 55+ unit tests and integration tests
 
@@ -23,11 +26,22 @@ A powerful Cloudflare Worker that enables automatic bidirectional synchronizatio
 │   Todoist   │────▶│ Cloudflare Worker│◀────│  Things 3   │
 │   (Inbox)   │     │   with KV Store  │     │  (Inbox)    │
 └─────────────┘     └──────────────────┘     └─────────────┘
-       ▲                    │                        │
-       │              Conflict Resolution            │
-       │              Metrics & Monitoring           │
-       └─────────────── macOS Scripts ◀──────────────┘
-                    (LaunchAgent + AppleScript)
+       ▲                    │ ▲                       │
+       │                    │ │                       │
+       │                    │ │ Webhooks In           │
+       │                    │ │ ┌─────────────┐       │
+       │                    │ └─│   GitHub    │       │
+       │                    │   │   Notion    │       │
+       │                    │   │   Slack     │       │
+       │                    │   │   Custom    │       │
+       │                    │   └─────────────┘       │
+       │                    │                         │
+       │              Conflict Resolution             │
+       │              Metrics & Monitoring            │
+       │              Cron Triggers (2min)            │
+       │              Outbound Webhooks               │
+       └─────────────── macOS Scripts ◀───────────────┘
+                  (CF Workers + AppleScript)
 ```
 
 ## 📋 Prerequisites
@@ -105,11 +119,151 @@ Or configure via AppleScript:
 osascript scripts/configure-sync-filters.applescript "Work,Personal" "important,urgent" "draft,archive"
 ```
 
+## 🪝 Webhook Integration
+
+### Inbound Webhooks (Real-time Task Creation)
+
+Receive webhooks from external services and automatically create tasks in Things:
+
+#### GitHub Integration
+```bash
+# Configure GitHub webhook
+curl -X PUT https://your-worker.workers.dev/webhook/config \
+  -H "Content-Type: application/json" \
+  -d '{
+    "enabled": true,
+    "sources": {
+      "github": {
+        "enabled": true,
+        "secret": "your-webhook-secret",
+        "repositories": ["owner/repo"],
+        "events": ["issues", "pull_request"]
+      }
+    }
+  }'
+
+# Add webhook URL to GitHub repository:
+# https://your-worker.workers.dev/webhook/github
+```
+
+#### Notion Integration
+```bash
+# Configure Notion webhook
+curl -X PUT https://your-worker.workers.dev/webhook/config \
+  -H "Content-Type: application/json" \
+  -d '{
+    "enabled": true,
+    "sources": {
+      "notion": {
+        "enabled": true,
+        "secret": "your-webhook-secret",
+        "databases": ["database-id-1"]
+      }
+    }
+  }'
+
+# Webhook URL: https://your-worker.workers.dev/webhook/notion
+```
+
+#### Slack Integration
+```bash
+# Configure Slack webhook for starred messages
+curl -X PUT https://your-worker.workers.dev/webhook/config \
+  -H "Content-Type: application/json" \
+  -d '{
+    "enabled": true,
+    "sources": {
+      "slack": {
+        "enabled": true,
+        "secret": "your-webhook-secret",
+        "channels": ["C1234567890"]
+      }
+    }
+  }'
+
+# Webhook URL: https://your-worker.workers.dev/webhook/slack
+```
+
+#### Generic Webhooks
+```bash
+# Configure custom webhook with transformation rules
+curl -X PUT https://your-worker.workers.dev/webhook/config \
+  -H "Content-Type: application/json" \
+  -d '{
+    "enabled": true,
+    "sources": {
+      "generic": {
+        "enabled": true,
+        "secret": "your-webhook-secret",
+        "transformRules": [{
+          "name": "Jira Issue",
+          "condition": {
+            "field": "issue.fields.project.key",
+            "operator": "equals",
+            "value": "PROJ"
+          },
+          "transformation": {
+            "title": "{{issue.fields.summary}}",
+            "notes": "Jira Issue: {{issue.key}}\n{{issue.fields.description}}",
+            "tags": ["jira", "{{issue.fields.priority.name}}"]
+          }
+        }]
+      }
+    }
+  }'
+
+# Webhook URL: https://your-worker.workers.dev/webhook/generic
+```
+
+### Outbound Webhooks (Event Notifications)
+
+Get notified when sync events occur:
+
+#### Subscribe to Events
+```bash
+# Add webhook subscriber
+curl -X POST https://your-worker.workers.dev/webhook/subscribers \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://your-app.com/webhook",
+    "secret": "your-secret",
+    "events": ["task_synced", "conflict_detected", "sync_completed"],
+    "enabled": true
+  }'
+```
+
+#### Available Events
+- `task_synced` - Tasks successfully synced between systems
+- `conflict_detected` - Sync conflict detected
+- `conflict_resolved` - Conflict automatically resolved
+- `sync_completed` - Sync operation completed successfully
+- `sync_failed` - Sync operation failed
+
+#### Webhook Payload Example
+```json
+{
+  "event": "task_synced",
+  "timestamp": "2024-01-15T10:30:00Z",
+  "data": {
+    "source": "things",
+    "target": "todoist",
+    "tasksCreated": 3,
+    "conflictsResolved": 1
+  },
+  "signature": "sha256=..."
+}
+```
+
 ## 📖 Usage
 
 ### Automatic Sync
 
-Once configured, the LaunchAgent runs automatically every 5 minutes. Enhanced sync features include:
+The system now offers two sync modes:
+
+**CF Workers Cron (Recommended)**: Server-side sync coordination runs every 2 minutes globally
+**Local LaunchAgent**: Traditional client-side sync every 5 minutes
+
+Enhanced sync features include:
 
 - Conflict detection and resolution
 - Project/tag filtering
@@ -175,6 +329,23 @@ curl -X POST https://your-worker.workers.dev/conflicts/resolve \
 - `GET /sync/status` - Sync system status
 - `GET /sync/verify` - Verify data consistency
 - `GET /health` - Health check
+
+### Webhook Management
+- `POST /webhook/github` - GitHub webhook endpoint
+- `POST /webhook/notion` - Notion webhook endpoint
+- `POST /webhook/slack` - Slack webhook endpoint
+- `POST /webhook/generic` - Generic webhook endpoint
+- `GET /webhook/config` - Get webhook configuration
+- `PUT /webhook/config` - Update webhook configuration
+- `POST /webhook/test` - Test webhook processing
+- `GET /webhook/subscribers` - List outbound webhook subscribers
+- `POST /webhook/subscribers` - Add outbound webhook subscriber
+- `DELETE /webhook/subscribers/{id}` - Remove webhook subscriber
+- `GET /webhook/deliveries?hours=24` - View webhook delivery status
+
+### Sync Coordination
+- `GET /sync/requests` - Check for pending sync requests (CF Workers ↔ Local)
+- `POST /sync/respond` - Respond with sync completion status
 
 ### Maintenance
 - `POST /sync/bulk` - Bulk sync operations (auth required)
