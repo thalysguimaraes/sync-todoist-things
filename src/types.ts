@@ -91,6 +91,15 @@ export interface TaskMapping {
   lastSynced: string;
   source: 'exact' | 'fuzzy' | 'hash' | 'legacy';
   version?: number; // For schema versioning
+  // Conflict resolution fields
+  todoistModifiedAt?: string;
+  thingsModifiedAt?: string;
+  lastSyncedContent?: {
+    title: string;
+    notes?: string;
+    due?: string;
+    labels?: string[];
+  };
 }
 
 export interface IdempotencyRecord {
@@ -109,4 +118,44 @@ export interface SyncState {
 export interface CompletedTask {
   thingsId: string;
   completedAt: string;
+}
+
+export type ConflictResolutionStrategy = 'todoist_wins' | 'things_wins' | 'newest_wins' | 'merge' | 'manual';
+
+export interface SyncConflict {
+  id: string;
+  todoistId: string;
+  thingsId: string;
+  detectedAt: string;
+  todoistVersion: {
+    title: string;
+    notes?: string;
+    due?: string;
+    labels?: string[];
+    modifiedAt?: string;
+  };
+  thingsVersion: {
+    title: string;
+    notes?: string;
+    due?: string;
+    tags?: string[];
+    modifiedAt?: string;
+  };
+  lastSyncedVersion?: {
+    title: string;
+    notes?: string;
+    due?: string;
+  };
+  suggestedResolution?: ConflictResolutionStrategy;
+  resolved: boolean;
+}
+
+export interface SyncConfig {
+  conflictStrategy: ConflictResolutionStrategy;
+  enabledProjects?: string[];
+  excludedProjects?: string[];
+  enabledTags?: string[];
+  excludedTags?: string[];
+  autoResolveConflicts: boolean;
+  syncInterval?: number;
 }

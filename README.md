@@ -2,270 +2,268 @@
 
 ![Todoist Things Sync Banner](public/banner-image.jpg)
 
-A Cloudflare Worker that enables automatic bidirectional synchronization between Todoist and Things 3 inboxes. Perfect for users who want to use Things on Apple devices while maintaining access to their tasks on Android through Todoist.
+A powerful Cloudflare Worker that enables automatic bidirectional synchronization between Todoist and Things 3, with advanced conflict resolution, selective sync, and comprehensive monitoring. Perfect for users who want to use Things on Apple devices while maintaining access to their tasks on other platforms through Todoist.
 
-## 🎯 Features
+## 🎯 Key Features
 
-- **Bidirectional Sync**: Tasks created in either app automatically appear in the other
-- **Duplicate Prevention**: Smart labeling system prevents sync loops
-- **Automatic Sync**: Runs every 5 minutes via macOS LaunchAgent
-- **Manual Sync**: Trigger sync on-demand when needed
-- **Preserves Task Properties**: Due dates, notes, and tags are maintained
-- **Non-destructive**: Tasks are labeled, not deleted after sync
+- **🔄 Bidirectional Sync**: Tasks created in either app automatically appear in the other
+- **🤝 Conflict Resolution**: Smart detection and resolution when tasks are modified in both apps
+- **🎯 Selective Sync**: Filter by projects and tags - sync only what you need
+- **🚫 Duplicate Prevention**: Advanced fingerprint-based deduplication
+- **📊 Performance Metrics**: Track sync performance and monitor health
+- **⚡ Idempotency**: Safe request retry with automatic deduplication
+- **🔧 Configuration API**: Customize sync behavior via REST API
+- **🚀 Easy Setup**: Automated setup wizard for quick deployment
+- **📝 Comprehensive Testing**: 55+ unit tests and integration tests
 
 ## 🏗 Architecture
 
 ```
 ┌─────────────┐     ┌──────────────────┐     ┌─────────────┐
 │   Todoist   │────▶│ Cloudflare Worker│◀────│  Things 3   │
-│   (Inbox)   │     │   (API Bridge)   │     │  (Inbox)    │
+│   (Inbox)   │     │   with KV Store  │     │  (Inbox)    │
 └─────────────┘     └──────────────────┘     └─────────────┘
-       ▲                                             │
-       │                                             │
+       ▲                    │                        │
+       │              Conflict Resolution            │
+       │              Metrics & Monitoring           │
        └─────────────── macOS Scripts ◀──────────────┘
                     (LaunchAgent + AppleScript)
 ```
 
 ## 📋 Prerequisites
 
-- macOS (for Things 3 and automation scripts)
-- Things 3 for Mac (with URL scheme enabled)
+- macOS (10.14 Mojave or later)
+- Things 3 for Mac
 - Todoist account with API access
 - Cloudflare account (free tier works)
-- Node.js 18+ and npm
+- Node.js 16+ and npm
 
-## 🚀 Installation
+## 🚀 Quick Start
 
-### 1. Clone and Install
+### Automated Setup (Recommended)
 
 ```bash
+# Clone the repository
 git clone https://github.com/yourusername/todoist-things-sync.git
 cd todoist-things-sync
-npm install
+
+# Run the setup wizard
+chmod +x scripts/setup.sh
+./scripts/setup.sh
 ```
 
-### 2. Get Todoist API Token
+The setup wizard will:
+- ✅ Check system requirements
+- ✅ Configure API tokens
+- ✅ Deploy the Cloudflare Worker
+- ✅ Set up automatic sync
+- ✅ Configure filtering (optional)
+- ✅ Run initial sync
+- ✅ Perform health check
 
-1. Log into [Todoist](https://todoist.com)
-2. Go to Settings → Integrations → Developer
-3. Copy your API token
+### Manual Setup
 
-### 3. Deploy to Cloudflare Workers
-
-```bash
-# Install Wrangler CLI globally (if not already installed)
-npm install -g wrangler
-
-# Login to Cloudflare
-wrangler login
-
-# Create KV namespace for sync metadata
-wrangler kv:namespace create "SYNC_METADATA"
-# Copy the ID from the output and update wrangler.toml with it
-
-# Create the secret for your API token
-wrangler secret put TODOIST_API_TOKEN
-# Paste your Todoist API token when prompted
-
-# Deploy the worker
-npm run deploy
-```
-
-Save your worker URL (e.g., `https://todoist-things-sync.YOUR-SUBDOMAIN.workers.dev`)
-
-### 4. Enable Things URL Scheme
-
-1. Open Things 3 on Mac
-2. Go to Things → Preferences → General
-3. Enable "Enable Things URLs"
-
-### 5. Setup macOS Automation
-
-```bash
-# Copy scripts to Library
-cp scripts/sync-bidirectional.sh ~/Library/Scripts/
-cp scripts/read-things-inbox.applescript ~/Library/Scripts/
-cp scripts/tag-things-synced.applescript ~/Library/Scripts/
-chmod +x ~/Library/Scripts/*.sh ~/Library/Scripts/*.applescript
-
-# Configure and install LaunchAgent
-export TODOIST_THINGS_WORKER_URL="https://YOUR-WORKER.workers.dev"
-./scripts/setup-launchagent.sh
-```
+See [docs/SETUP.md](docs/SETUP.md) for detailed manual setup instructions.
 
 ## 🔧 Configuration
 
-### Environment Variables
+### Conflict Resolution Strategies
 
-Create a `.env` file for local development:
+Configure how conflicts are handled when tasks are modified in both apps:
 
 ```bash
-TODOIST_API_TOKEN=your_token_here
+curl -X PUT https://your-worker.workers.dev/config \
+  -H "Content-Type: application/json" \
+  -d '{
+    "conflictStrategy": "newest_wins",
+    "autoResolveConflicts": true
+  }'
 ```
 
-### Sync Interval
+Available strategies:
+- `todoist_wins` - Always use Todoist version
+- `things_wins` - Always use Things version
+- `newest_wins` - Use most recently modified (default)
+- `merge` - Intelligently merge non-conflicting changes
+- `manual` - Store conflicts for manual resolution
 
-By default, sync runs every 5 minutes. To change this, edit the LaunchAgent plist:
+### Selective Sync
 
-```xml
-<key>StartInterval</key>
-<integer>300</integer><!-- seconds -->
+Filter which projects and tags to sync:
+
+```bash
+curl -X PUT https://your-worker.workers.dev/config \
+  -H "Content-Type: application/json" \
+  -d '{
+    "enabledProjects": ["Work", "Personal"],
+    "excludedTags": ["draft", "archive"]
+  }'
 ```
 
-### Sync Direction
-
-You can use individual sync scripts if you only want one-way sync:
-
-- **Todoist → Things only**: Use `sync-todoist-things-safe.sh`
-- **Things → Todoist only**: Manually call the Things sync endpoint
+Or configure via AppleScript:
+```bash
+osascript scripts/configure-sync-filters.applescript "Work,Personal" "important,urgent" "draft,archive"
+```
 
 ## 📖 Usage
 
 ### Automatic Sync
 
-Once configured, the LaunchAgent runs automatically every 5 minutes. Tasks are synced between both inboxes with these rules:
+Once configured, the LaunchAgent runs automatically every 5 minutes. Enhanced sync features include:
 
-- New tasks in Todoist inbox → Copied to Things inbox
-- New tasks in Things inbox → Copied to Todoist inbox
-- Synced tasks are labeled to prevent re-syncing
+- Conflict detection and resolution
+- Project/tag filtering
+- Performance metrics tracking
+- Error notifications
 
 ### Manual Sync
 
 ```bash
-# Run full bidirectional sync
-~/Library/Scripts/sync-bidirectional.sh
+# Run enhanced bidirectional sync
+~/Library/Scripts/todoist-things-sync/sync-bidirectional-v2.sh
+
+# Run original sync (without filtering)
+~/Library/Scripts/todoist-things-sync/sync-bidirectional.sh
 
 # Check sync status
-tail -f ~/Library/Logs/todoist-things-sync.log
+curl https://your-worker.workers.dev/sync/status
 ```
 
-### Managing Synced Tasks
+### View Metrics
 
-- **Todoist**: Synced tasks have labels `synced-to-things` or `synced-from-things`
-- **Things**: Synced tasks have tag `synced-from-todoist`
+```bash
+# Performance metrics (last 24 hours)
+curl https://your-worker.workers.dev/metrics
 
-To clean up old synced tasks in Todoist:
-1. Filter by label: `@synced-to-things`
-2. Select all and archive/delete
+# List unresolved conflicts
+curl https://your-worker.workers.dev/conflicts
+
+# Health check
+curl https://your-worker.workers.dev/health
+```
+
+### Resolve Conflicts
+
+```bash
+# List conflicts
+curl https://your-worker.workers.dev/conflicts
+
+# Resolve specific conflict
+curl -X POST https://your-worker.workers.dev/conflicts/resolve \
+  -H "Content-Type: application/json" \
+  -d '{"conflictId": "conflict-123", "strategy": "merge"}'
+```
 
 ## 🔌 API Endpoints
 
-### GET /inbox
-Fetch unsynced tasks from Todoist inbox
+### Core Sync
+- `GET /inbox` - Fetch Todoist inbox tasks
+- `POST /things/sync` - Sync from Things to Todoist
+- `POST /things/sync-completed` - Sync completed tasks
+- `POST /inbox/mark-synced` - Mark tasks as synced
+
+### Conflict Resolution
+- `GET /conflicts` - List unresolved conflicts
+- `POST /conflicts/resolve` - Resolve a specific conflict
+
+### Configuration
+- `GET /config` - Get current configuration
+- `PUT /config` - Update configuration
+
+### Monitoring
+- `GET /metrics?hours=24` - Performance metrics
+- `GET /sync/status` - Sync system status
+- `GET /sync/verify` - Verify data consistency
+- `GET /health` - Health check
+
+### Maintenance
+- `POST /sync/bulk` - Bulk sync operations (auth required)
+- `POST /metrics/cleanup` - Clean old metrics (auth required)
+
+## 🧪 Testing
 
 ```bash
-curl https://your-worker.workers.dev/inbox
-```
+# Run all tests (55+ tests)
+npm test
 
-### GET /inbox?format=url
-Get Things-compatible import URL
+# Run with UI
+npm run test:ui
 
-```bash
-curl https://your-worker.workers.dev/inbox?format=url
-```
-
-### POST /inbox/mark-synced
-Mark tasks as synced (adds label)
-
-```bash
-curl -X POST https://your-worker.workers.dev/inbox/mark-synced
-```
-
-### POST /things/sync
-Sync tasks from Things to Todoist
-
-```bash
-curl -X POST https://your-worker.workers.dev/things/sync \
-  -H "Content-Type: application/json" \
-  -d '[{"id":"123","title":"Task","notes":"","due":null,"tags":[]}]'
+# Coverage report
+npm run test:coverage
 ```
 
 ## 🐛 Troubleshooting
 
-### Sync not running
+### Common Issues
 
+**Sync not running:**
 ```bash
-# Check if LaunchAgent is loaded
 launchctl list | grep todoist
-
-# Reload if needed
-launchctl unload ~/Library/LaunchAgents/com.todoist-things.bidirectional.plist
-launchctl load ~/Library/LaunchAgents/com.todoist-things.bidirectional.plist
-```
-
-### AppleScript permissions
-
-1. Go to System Preferences → Security & Privacy → Privacy → Accessibility
-2. Add Terminal.app (or iTerm) to allowed apps
-3. Restart the sync script
-
-### Things not opening
-
-- Ensure Things 3 is installed and has been opened at least once
-- Test URL scheme: `open "things:///add?title=Test"`
-- Check that "Enable Things URLs" is enabled in Things preferences
-
-### View logs
-
-```bash
-# Sync logs
 tail -f ~/Library/Logs/todoist-things-sync.log
-
-# LaunchAgent errors
-tail -f ~/Library/Logs/todoist-things-sync.stderr.log
 ```
+
+**Things not responding:**
+- Check System Preferences → Security & Privacy → Privacy → Automation
+- Ensure Terminal has permission to control Things
+
+**Conflicts not resolving:**
+```bash
+# Check conflict status
+curl https://your-worker.workers.dev/conflicts
+
+# Force manual resolution
+curl -X POST https://your-worker.workers.dev/conflicts/resolve \
+  -H "Content-Type: application/json" \
+  -d '{"conflictId": "CONFLICT_ID", "strategy": "newest_wins"}'
+```
+
+See [docs/SETUP.md](docs/SETUP.md#troubleshooting) for comprehensive troubleshooting.
 
 ## 🛠 Development
-
-### Local Testing
-
-```bash
-# Copy .env.example and add your token
-cp .env.example .env
-
-# Run locally
-npm run dev
-
-# Test endpoints
-curl http://localhost:8787/health
-```
 
 ### Project Structure
 
 ```
 ├── src/
-│   ├── index.ts        # Main worker entry point
-│   ├── todoist.ts      # Todoist API client
-│   ├── things.ts       # Things format converter
-│   └── types.ts        # TypeScript types
+│   ├── index.ts         # Main worker entry
+│   ├── todoist.ts       # Todoist API client
+│   ├── things.ts        # Things format converter
+│   ├── conflicts.ts     # Conflict resolution system
+│   ├── config.ts        # Configuration management
+│   ├── metrics.ts       # Performance tracking
+│   └── types.ts         # TypeScript types
 ├── scripts/
-│   ├── sync-bidirectional.sh      # Main sync script
-│   ├── read-things-inbox.applescript  # Read Things tasks
-│   └── setup-launchagent.sh      # Install automation
-└── wrangler.toml       # Cloudflare config
+│   ├── setup.sh         # Automated setup wizard
+│   ├── sync-bidirectional-v2.sh  # Enhanced sync
+│   ├── configure-sync-filters.applescript  # Filter config
+│   └── read-things-inbox-filtered.applescript  # Filtered reading
+├── docs/
+│   └── SETUP.md         # Detailed setup guide
+└── tests/
+    ├── unit/            # Unit tests
+    └── integration/     # Integration tests
 ```
 
-## 🤝 Contributing
+### Local Development
 
-Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+```bash
+# Install dependencies
+npm install
 
-### Development Setup
+# Run locally
+npm run dev
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Run tests (when available)
-5. Submit a pull request
+# Run tests
+npm test
+
+# Deploy to Cloudflare
+npm run deploy
+```
 
 ## 📄 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- Inspired by various Todoist-Things integration attempts
-- Built with Cloudflare Workers for reliability
-- Uses Things 3 URL scheme for integration
 
 ## ⚠️ Legal Disclaimer
 
@@ -286,17 +284,13 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - You are responsible for complying with both services' Terms of Service
 - The project maintainers assume no liability for any issues arising from use
 
-## ⚠️ Additional Disclaimers
-
-- Tested on macOS Ventura/Sonoma with Things 3.18+
-- Requires valid subscriptions/licenses for both services
-- Not intended for commercial use
-
 ## 🔗 Links
 
 - [Todoist API Documentation](https://developer.todoist.com/rest/v2/)
 - [Things URL Scheme](https://culturedcode.com/things/support/articles/2803573/)
 - [Cloudflare Workers](https://workers.cloudflare.com/)
+- [Setup Documentation](docs/SETUP.md)
+- [API Reference](CLAUDE.md)
 
 ---
 
