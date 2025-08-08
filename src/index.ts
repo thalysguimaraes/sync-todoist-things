@@ -1,4 +1,15 @@
-import { Env, ThingsInboxTask, SyncMetadata, CompletedTask, TaskMapping, IdempotencyRecord } from './types';
+import { 
+  Env, 
+  ThingsInboxTask, 
+  SyncMetadata, 
+  CompletedTask, 
+  TaskMapping, 
+  IdempotencyRecord,
+  SyncConflict,
+  ConflictResolutionStrategy,
+  SyncConfig,
+  TodoistTask
+} from './types';
 import { TodoistClient } from './todoist';
 import { convertToThingsFormat, generateThingsUrl } from './things';
 import { 
@@ -9,6 +20,9 @@ import {
   addThingsIdToNotes,
   createTaskFingerprint
 } from './utils';
+import { MetricsTracker } from './metrics';
+import { ConflictResolver } from './conflicts';
+import { ConfigManager } from './config';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -27,11 +41,24 @@ export default {
 
     try {
       const todoist = new TodoistClient(env);
+      const metrics = new MetricsTracker(env);
 
       if (path === '/inbox' && request.method === 'GET') {
         // Get tasks, excluding already synced ones by default
         const includeAll = url.searchParams.get('include_all') === 'true';
         const tasks = await todoist.getInboxTasks(!includeAll, env.SYNC_METADATA);
+        
+        // Record metric for inbox fetch
+        await metrics.recordMetric({
+          timestamp: new Date().toISOString(),
+          type: 'inbox_fetch',
+          success: true,
+          duration: 0, // Will be tracked at higher level if needed
+          details: {
+            tasksProcessed: tasks.length,
+            source: includeAll ? 'all' : 'filtered'
+          }
+        });
         
         // Enhance tasks with Things IDs from descriptions
         const enhancedTasks = tasks.map(task => {
@@ -260,6 +287,10 @@ export default {
           });
         }
         
+        const startTime = Date.now();
+        let syncSuccess = true;
+        let syncError: string | undefined;
+
         try {
           // Receive tasks from Things and sync to Todoist
           const thingsTasks = await request.json() as ThingsInboxTask[];
@@ -277,7 +308,72 @@ export default {
                 );
                 
                 if (existingMapping) {
-                  // Create fingerprint and store updated mapping
+                  // Check for conflicts if we have lastSyncedContent
+                  const configManager = new ConfigManager(env.SYNC_METADATA);
+                  await configManager.loadConfig();
+                  const resolver = new ConflictResolver(configManager.getConfig());
+                  
+                  // Get the current Todoist task to check for conflicts
+                  const todoistTask = await todoist.request<TodoistTask>(`/tasks/${existingMapping.todoistId}`);
+                  
+                  if (existingMapping.lastSyncedContent) {
+                    const conflict = await resolver.detectConflict(
+                      todoistTask,
+                      task,
+                      existingMapping
+                    );
+                    
+                    if (conflict) {
+                      // Store conflict for resolution
+                      await resolver.storeConflict(conflict, env.SYNC_METADATA);
+                      
+                      // If auto-resolve is enabled, resolve it
+                      if (configManager.getConfig().autoResolveConflicts) {
+                        try {
+                          const resolution = await resolver.resolveConflict(conflict);
+                          
+                          // Update Todoist with resolved values
+                          await todoist.request(`/tasks/${existingMapping.todoistId}`, {
+                            method: 'POST',
+                            body: JSON.stringify({
+                              content: resolution.resolvedTask.title || resolution.resolvedTask.content,
+                              description: resolution.resolvedTask.notes || resolution.resolvedTask.description,
+                              due_date: resolution.resolvedTask.due,
+                              labels: resolution.resolvedTask.labels
+                            })
+                          });
+                          
+                          await resolver.markConflictResolved(conflict.id, env.SYNC_METADATA);
+                          
+                          return {
+                            id: task.id,
+                            title: task.title,
+                            status: 'conflict_resolved',
+                            resolution_strategy: resolution.appliedStrategy,
+                            todoist_id: existingMapping.todoistId
+                          };
+                        } catch (error) {
+                          return {
+                            id: task.id,
+                            title: task.title,
+                            status: 'conflict_detected',
+                            conflict_id: conflict.id,
+                            todoist_id: existingMapping.todoistId
+                          };
+                        }
+                      } else {
+                        return {
+                          id: task.id,
+                          title: task.title,
+                          status: 'conflict_detected',
+                          conflict_id: conflict.id,
+                          todoist_id: existingMapping.todoistId
+                        };
+                      }
+                    }
+                  }
+                  
+                  // No conflict, update mapping with current content
                   const fingerprint = await createTaskFingerprint(task.title, task.notes, task.due);
                   
                   const updatedMapping: TaskMapping = {
@@ -286,7 +382,15 @@ export default {
                     fingerprint,
                     lastSynced: new Date().toISOString(),
                     source: existingMapping.source,
-                    version: 2
+                    version: 2,
+                    lastSyncedContent: {
+                      title: task.title,
+                      notes: task.notes,
+                      due: task.due,
+                      labels: todoistTask.labels
+                    },
+                    thingsModifiedAt: new Date().toISOString(),
+                    todoistModifiedAt: todoistTask.created_at
                   };
                   
                   // Store by fingerprint hash (new method)
@@ -345,14 +449,22 @@ export default {
                 // Create fingerprint for the new task
                 const fingerprint = await createTaskFingerprint(task.title, task.notes, task.due);
                 
-                // Store mapping using new fingerprint method
+                // Store mapping using new fingerprint method with sync state
                 const taskMapping: TaskMapping = {
                   todoistId: newTask.id,
                   thingsId: task.id,
                   fingerprint,
                   lastSynced: new Date().toISOString(),
                   source: 'exact',
-                  version: 2
+                  version: 2,
+                  lastSyncedContent: {
+                    title: task.title,
+                    notes: task.notes,
+                    due: task.due,
+                    labels: taskLabels
+                  },
+                  thingsModifiedAt: new Date().toISOString(),
+                  todoistModifiedAt: newTask.created_at
                 };
                 
                 await env.SYNC_METADATA.put(
@@ -399,12 +511,38 @@ export default {
           const created = results.filter(r => r.status === 'created').length;
           const existing = results.filter(r => r.status === 'already_exists').length;
           const errors = results.filter(r => r.status === 'error').length;
+          const conflictsDetected = results.filter(r => r.status === 'conflict_detected').length;
+          const conflictsResolved = results.filter(r => r.status === 'conflict_resolved').length;
           
           const responseData = { 
             results, 
-            summary: { created, existing, errors, total: results.length }
+            summary: { 
+              created, 
+              existing, 
+              errors, 
+              conflictsDetected,
+              conflictsResolved,
+              total: results.length 
+            }
           };
           
+          // Record sync metrics
+          await metrics.recordMetric({
+            timestamp: new Date().toISOString(),
+            type: 'things_sync',
+            success: errors === 0,
+            duration: Date.now() - startTime,
+            details: {
+              tasksProcessed: results.length,
+              created,
+              existing,
+              errors,
+              direction: 'things_to_todoist',
+              conflictsDetected,
+              conflictsResolved
+            }
+          });
+
           // Store idempotency record if request ID provided
           if (requestId) {
             const idempotencyRecord: IdempotencyRecord = {
@@ -429,12 +567,31 @@ export default {
           return new Response(JSON.stringify(responseData), {
             headers: { ...corsHeaders, 'Content-Type': 'application/json' },
           });
+        } catch (error) {
+          syncSuccess = false;
+          syncError = error instanceof Error ? error.message : 'Unknown error';
+          
+          // Record failure metric
+          await metrics.recordMetric({
+            timestamp: new Date().toISOString(),
+            type: 'things_sync',
+            success: false,
+            duration: Date.now() - startTime,
+            details: {
+              direction: 'things_to_todoist'
+            },
+            errorMessage: syncError
+          });
+
+          throw error;
         } finally {
           await releaseSyncLock(env.SYNC_METADATA);
         }
       }
 
       if (path === '/things/sync-completed' && request.method === 'POST') {
+        const startTime = Date.now();
+        
         try {
           // Receive completed tasks from Things
           const completedTasks = await request.json() as CompletedTask[];
@@ -543,6 +700,20 @@ export default {
           const notFound = results.filter(r => r.status === 'not_found').length;
           const errors = results.filter(r => r.status === 'error').length;
           
+          // Record metrics for completed sync
+          await metrics.recordMetric({
+            timestamp: new Date().toISOString(),
+            type: 'completed_sync',
+            success: errors === 0,
+            duration: Date.now() - startTime,
+            details: {
+              tasksProcessed: results.length,
+              completed,
+              errors,
+              source: 'things_completed'
+            }
+          });
+          
           return new Response(JSON.stringify({
             results,
             summary: { completed, notFound, errors, total: results.length }
@@ -551,6 +722,19 @@ export default {
           });
         } catch (error) {
           console.error('Error syncing completed tasks:', error);
+          
+          // Record failure metric
+          await metrics.recordMetric({
+            timestamp: new Date().toISOString(),
+            type: 'completed_sync',
+            success: false,
+            duration: Date.now() - startTime,
+            details: {
+              source: 'things_completed'
+            },
+            errorMessage: error instanceof Error ? error.message : 'Unknown error'
+          });
+          
           return new Response(JSON.stringify({
             error: 'Failed to sync completed tasks',
             message: error instanceof Error ? error.message : 'Unknown error'
@@ -1228,6 +1412,7 @@ export default {
 
         const dryRun = url.searchParams.get('dry_run') === 'true';
         const direction = url.searchParams.get('direction') || 'both'; // both, todoist_to_things, things_to_todoist
+        const startTime = Date.now();
         
         const results = {
           todoistTasks: 0,
@@ -1304,6 +1489,21 @@ export default {
             results.actions.push('Things to Todoist sync must be initiated from the client script');
           }
 
+          // Record bulk sync metrics
+          await metrics.recordMetric({
+            timestamp: new Date().toISOString(),
+            type: 'bulk_sync',
+            success: results.errors.length === 0,
+            duration: Date.now() - startTime,
+            details: {
+              tasksProcessed: results.todoistTasks,
+              created: results.mappingsCreated,
+              errors: results.errors.length,
+              direction,
+              source: dryRun ? 'dry_run' : 'executed'
+            }
+          });
+
           return new Response(JSON.stringify({
             ...results,
             summary: `Processed ${results.todoistTasks} tasks, cleared ${results.mappingsCleared} mappings, created ${results.mappingsCreated} new mappings`,
@@ -1312,10 +1512,216 @@ export default {
             headers: { ...corsHeaders, 'Content-Type': 'application/json' },
           });
         } catch (error) {
+          // Record failure metric
+          await metrics.recordMetric({
+            timestamp: new Date().toISOString(),
+            type: 'bulk_sync',
+            success: false,
+            duration: Date.now() - startTime,
+            details: {
+              direction,
+              source: dryRun ? 'dry_run' : 'executed'
+            },
+            errorMessage: error instanceof Error ? error.message : 'Unknown error'
+          });
+
           return new Response(JSON.stringify({
             error: 'Bulk sync failed',
             message: error instanceof Error ? error.message : 'Unknown error',
             results
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      if (path === '/metrics' && request.method === 'GET') {
+        try {
+          const hours = parseInt(url.searchParams.get('hours') || '24');
+          const summary = await metrics.getMetricsSummary(hours);
+          
+          return new Response(JSON.stringify(summary), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({
+            error: 'Failed to get metrics',
+            message: error instanceof Error ? error.message : 'Unknown error'
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      if (path === '/metrics/cleanup' && request.method === 'POST') {
+        // Require auth header for maintenance operations
+        const authHeader = request.headers.get('X-Repair-Auth');
+        if (authHeader !== env.REPAIR_AUTH_TOKEN) {
+          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+            status: 401,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+
+        try {
+          const deleted = await metrics.cleanupOldMetrics();
+          return new Response(JSON.stringify({
+            deleted,
+            message: `Cleaned up ${deleted} old metrics`
+          }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({
+            error: 'Failed to cleanup metrics',
+            message: error instanceof Error ? error.message : 'Unknown error'
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      // Conflict resolution endpoints
+      if (path === '/conflicts' && request.method === 'GET') {
+        try {
+          const configManager = new ConfigManager(env.SYNC_METADATA);
+          await configManager.loadConfig();
+          const resolver = new ConflictResolver(configManager.getConfig());
+          
+          const conflicts = await resolver.getUnresolvedConflicts(env.SYNC_METADATA);
+          
+          return new Response(JSON.stringify({
+            conflicts,
+            count: conflicts.length,
+            timestamp: new Date().toISOString()
+          }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({
+            error: 'Failed to get conflicts',
+            message: error instanceof Error ? error.message : 'Unknown error'
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      if (path === '/conflicts/resolve' && request.method === 'POST') {
+        try {
+          const body = await request.json() as {
+            conflictId: string;
+            strategy?: ConflictResolutionStrategy;
+          };
+          
+          const configManager = new ConfigManager(env.SYNC_METADATA);
+          await configManager.loadConfig();
+          const resolver = new ConflictResolver(configManager.getConfig());
+          
+          // Get the conflict
+          const conflicts = await resolver.getUnresolvedConflicts(env.SYNC_METADATA);
+          const conflict = conflicts.find(c => c.id === body.conflictId);
+          
+          if (!conflict) {
+            return new Response(JSON.stringify({
+              error: 'Conflict not found',
+              conflictId: body.conflictId
+            }), {
+              status: 404,
+              headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+            });
+          }
+          
+          // Resolve the conflict
+          const resolution = await resolver.resolveConflict(conflict, body.strategy);
+          
+          // Mark as resolved
+          await resolver.markConflictResolved(conflict.id, env.SYNC_METADATA);
+          
+          // Record metric
+          await metrics.recordMetric({
+            timestamp: new Date().toISOString(),
+            type: 'things_sync',
+            success: true,
+            duration: 0,
+            details: {
+              source: 'conflict_resolution',
+              direction: resolution.appliedStrategy
+            }
+          });
+          
+          return new Response(JSON.stringify({
+            resolved: true,
+            resolution: resolution.resolvedTask,
+            strategy: resolution.appliedStrategy,
+            timestamp: new Date().toISOString()
+          }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({
+            error: 'Failed to resolve conflict',
+            message: error instanceof Error ? error.message : 'Unknown error'
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      // Configuration endpoints
+      if (path === '/config' && request.method === 'GET') {
+        try {
+          const configManager = new ConfigManager(env.SYNC_METADATA);
+          const config = await configManager.loadConfig();
+          
+          return new Response(JSON.stringify(config), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({
+            error: 'Failed to get configuration',
+            message: error instanceof Error ? error.message : 'Unknown error'
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      if (path === '/config' && request.method === 'PUT') {
+        try {
+          const body = await request.json() as Partial<SyncConfig>;
+          const configManager = new ConfigManager(env.SYNC_METADATA);
+          
+          // Validate configuration
+          const validation = configManager.validateConfig(body);
+          if (!validation.valid) {
+            return new Response(JSON.stringify({
+              error: 'Invalid configuration',
+              errors: validation.errors
+            }), {
+              status: 400,
+              headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+            });
+          }
+          
+          const config = await configManager.saveConfig(body);
+          
+          return new Response(JSON.stringify({
+            config,
+            message: 'Configuration updated successfully'
+          }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({
+            error: 'Failed to update configuration',
+            message: error instanceof Error ? error.message : 'Unknown error'
           }), {
             status: 500,
             headers: { ...corsHeaders, 'Content-Type': 'application/json' },
