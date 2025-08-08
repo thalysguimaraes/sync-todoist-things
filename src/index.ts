@@ -273,6 +273,11 @@ export default {
                   labels: taskLabels,
                 });
                 
+                // Back-reference: add Things ID to Todoist description for resilience
+                try {
+                  await todoist.updateTaskWithThingsId(newTask.id, task.id);
+                } catch {}
+                
                 // Create fingerprint for the new task
                 const fingerprint = await createTaskFingerprint(task.title, task.notes, task.due);
                 

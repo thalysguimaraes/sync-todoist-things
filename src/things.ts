@@ -24,7 +24,8 @@ export function convertToThingsFormat(todoistTasks: TodoistTask[]): ThingsTask[]
     }
 
     if (task.labels.length > 0) {
-      thingsTask.attributes.tags = task.labels;
+      // Strip sync-only tags from user-facing import
+      thingsTask.attributes.tags = task.labels.filter(l => l !== 'synced-to-things' && l !== 'synced-from-things');
     }
 
     return thingsTask;
