@@ -54,11 +54,21 @@ run_applescript() {
     return 1
 }
 
+# Function to show notification
+notify() {
+    local title="$1"
+    local message="$2"
+    osascript -e "display notification \"$message\" with title \"$title\"" 2>/dev/null &
+}
+
 # Start bidirectional sync
 log "Starting bidirectional sync..."
 
 # Check if Things is running
-check_things_running
+if ! check_things_running; then
+    notify "Todoist-Things Sync" "Sync failed: Things3 not running"
+    exit 1
+fi
 
 # STEP 1: Sync from Todoist to Things
 log "Step 1: Syncing from Todoist → Things"
@@ -68,6 +78,7 @@ todoist_response=$(curl -s "${WORKER_URL}/inbox?format=url")
 
 if [ $? -ne 0 ]; then
     log "ERROR: Failed to fetch tasks from Todoist"
+    notify "Todoist-Things Sync" "Failed to fetch tasks from Todoist"
     exit 1
 fi
 
@@ -86,6 +97,7 @@ if [ "$todoist_count" -gt 0 ] 2>/dev/null; then
     import_result=$(run_applescript "${SCRIPT_DIR}/import-todoist-tasks.applescript" "$todoist_tasks")
     if [ $? -ne 0 ]; then
         log "ERROR: Failed to import tasks to Things"
+        notify "Todoist-Things Sync" "Failed to import tasks to Things"
     else
         log "Import result: $import_result"
     fi
@@ -153,6 +165,7 @@ else
         fi
     else
         log "ERROR: Failed to sync tasks from Things to Todoist"
+        notify "Todoist-Things Sync" "Failed to sync Things tasks to Todoist"
     fi
 fi
 
@@ -183,10 +196,14 @@ else
         log "Completed tasks sync: $completed marked done, $not_found not found, $errors errors"
     else
         log "ERROR: Failed to sync completed tasks from Things to Todoist"
+        notify "Todoist-Things Sync" "Failed to sync completed tasks"
     fi
 fi
 
 log "Bidirectional sync completed"
+
+# Success notification
+notify "Todoist-Things Sync" "Sync completed successfully"
 
 # Summary
 echo "Sync completed at $(date '+%Y-%m-%d %H:%M:%S')"

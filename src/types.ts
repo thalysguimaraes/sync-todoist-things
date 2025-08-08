@@ -90,6 +90,14 @@ export interface TaskMapping {
   fingerprint: TaskFingerprint;
   lastSynced: string;
   source: 'exact' | 'fuzzy' | 'hash' | 'legacy';
+  version?: number; // For schema versioning
+}
+
+export interface IdempotencyRecord {
+  requestId: string;
+  result: any;
+  timestamp: string;
+  ttl: number; // TTL in seconds from creation
 }
 
 export interface SyncState {

@@ -1,4 +1,4 @@
-import { Env, ThingsInboxTask, SyncMetadata, CompletedTask, TaskMapping } from './types';
+import { Env, ThingsInboxTask, SyncMetadata, CompletedTask, TaskMapping, IdempotencyRecord } from './types';
 import { TodoistClient } from './todoist';
 import { convertToThingsFormat, generateThingsUrl } from './things';
 import { 
@@ -79,6 +79,26 @@ export default {
       }
 
       if (path === '/inbox/mark-synced' && request.method === 'POST') {
+        // Check for idempotency
+        const requestId = request.headers.get('X-Request-Id');
+        if (requestId) {
+          const idempotencyKey = `idempotency:${requestId}`;
+          const existing = await env.SYNC_METADATA.get(idempotencyKey);
+          if (existing) {
+            const record = JSON.parse(existing) as IdempotencyRecord;
+            const recordAge = (Date.now() - new Date(record.timestamp).getTime()) / 1000;
+            if (recordAge < record.ttl) {
+              return new Response(JSON.stringify({
+                ...record.result,
+                fromCache: true,
+                cachedAt: record.timestamp
+              }), {
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+              });
+            }
+          }
+        }
+        
         // Mark tasks as synced using fingerprint-based tracking
         const tasks = await todoist.getInboxTasks(true, env.SYNC_METADATA); // Get unsynced tasks
         
@@ -125,7 +145,29 @@ export default {
           })
         );
         
-        return new Response(JSON.stringify({ results, count: results.length }), {
+        const responseData = { results, count: results.length };
+        
+        // Store idempotency record if request ID provided
+        if (requestId) {
+          const idempotencyRecord: IdempotencyRecord = {
+            requestId,
+            result: responseData,
+            timestamp: new Date().toISOString(),
+            ttl: 600 // 10 minutes
+          };
+          
+          try {
+            await env.SYNC_METADATA.put(
+              `idempotency:${requestId}`,
+              JSON.stringify(idempotencyRecord),
+              { expirationTtl: 600 }
+            );
+          } catch (error) {
+            console.error('Failed to store idempotency record:', error);
+          }
+        }
+        
+        return new Response(JSON.stringify(responseData), {
           headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         });
       }
@@ -185,6 +227,27 @@ export default {
       }
 
       if (path === '/things/sync' && request.method === 'POST') {
+        // Check for idempotency
+        const requestId = request.headers.get('X-Request-Id');
+        if (requestId) {
+          const idempotencyKey = `idempotency:${requestId}`;
+          const existing = await env.SYNC_METADATA.get(idempotencyKey);
+          if (existing) {
+            const record = JSON.parse(existing) as IdempotencyRecord;
+            // Check if record is still valid (within TTL)
+            const recordAge = (Date.now() - new Date(record.timestamp).getTime()) / 1000;
+            if (recordAge < record.ttl) {
+              return new Response(JSON.stringify({
+                ...record.result,
+                fromCache: true,
+                cachedAt: record.timestamp
+              }), {
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+              });
+            }
+          }
+        }
+        
         // Acquire sync lock to prevent concurrent syncs
         const lockAcquired = await acquireSyncLock(env.SYNC_METADATA);
         if (!lockAcquired) {
@@ -222,7 +285,8 @@ export default {
                     thingsId: task.id,
                     fingerprint,
                     lastSynced: new Date().toISOString(),
-                    source: existingMapping.source
+                    source: existingMapping.source,
+                    version: 2
                   };
                   
                   // Store by fingerprint hash (new method)
@@ -287,7 +351,8 @@ export default {
                   thingsId: task.id,
                   fingerprint,
                   lastSynced: new Date().toISOString(),
-                  source: 'exact'
+                  source: 'exact',
+                  version: 2
                 };
                 
                 await env.SYNC_METADATA.put(
@@ -335,10 +400,33 @@ export default {
           const existing = results.filter(r => r.status === 'already_exists').length;
           const errors = results.filter(r => r.status === 'error').length;
           
-          return new Response(JSON.stringify({ 
+          const responseData = { 
             results, 
             summary: { created, existing, errors, total: results.length }
-          }), {
+          };
+          
+          // Store idempotency record if request ID provided
+          if (requestId) {
+            const idempotencyRecord: IdempotencyRecord = {
+              requestId,
+              result: responseData,
+              timestamp: new Date().toISOString(),
+              ttl: 600 // 10 minutes
+            };
+            
+            try {
+              await env.SYNC_METADATA.put(
+                `idempotency:${requestId}`,
+                JSON.stringify(idempotencyRecord),
+                { expirationTtl: 600 }
+              );
+            } catch (error) {
+              // Don't fail the request if idempotency storage fails
+              console.error('Failed to store idempotency record:', error);
+            }
+          }
+          
+          return new Response(JSON.stringify(responseData), {
             headers: { ...corsHeaders, 'Content-Type': 'application/json' },
           });
         } finally {
@@ -1120,6 +1208,114 @@ export default {
           return new Response(JSON.stringify({
             error: 'Verification failed',
             message: error instanceof Error ? error.message : 'Unknown error'
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      if (path === '/sync/bulk' && request.method === 'POST') {
+        // Bulk sync endpoint for force re-sync
+        // Requires auth for safety
+        const authHeader = request.headers.get('X-Repair-Auth');
+        if (authHeader !== env.REPAIR_AUTH_TOKEN) {
+          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+            status: 401,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+
+        const dryRun = url.searchParams.get('dry_run') === 'true';
+        const direction = url.searchParams.get('direction') || 'both'; // both, todoist_to_things, things_to_todoist
+        
+        const results = {
+          todoistTasks: 0,
+          mappingsCleared: 0,
+          mappingsCreated: 0,
+          errors: [],
+          dryRun,
+          direction,
+          actions: []
+        };
+
+        try {
+          if (direction === 'both' || direction === 'clear_mappings') {
+            // Step 1: Clear all existing mappings for a fresh start
+            const hashList = await env.SYNC_METADATA.list({ prefix: 'hash:' });
+            for (const key of hashList.keys) {
+              if (!dryRun) {
+                await env.SYNC_METADATA.delete(key.name);
+              }
+              results.mappingsCleared++;
+              results.actions.push(`Clear mapping: ${key.name}`);
+            }
+
+            // Clear legacy mappings too
+            const legacyList = await env.SYNC_METADATA.list({ prefix: 'mapping:' });
+            for (const key of legacyList.keys) {
+              if (!dryRun) {
+                await env.SYNC_METADATA.delete(key.name);
+              }
+              results.mappingsCleared++;
+              results.actions.push(`Clear legacy: ${key.name}`);
+            }
+          }
+
+          if (direction === 'both' || direction === 'todoist_to_things') {
+            // Step 2: Force re-sync all Todoist tasks
+            const allTasks = await todoist.getInboxTasks(false); // Get all tasks
+            results.todoistTasks = allTasks.length;
+
+            // Create fresh mappings for all tasks
+            for (const task of allTasks) {
+              try {
+                const fingerprint = await createTaskFingerprint(task.content, task.description);
+                const taskMapping: TaskMapping = {
+                  todoistId: task.id,
+                  thingsId: `bulk-sync-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+                  fingerprint,
+                  lastSynced: new Date().toISOString(),
+                  source: 'exact',
+                  version: 2
+                };
+
+                if (!dryRun) {
+                  await env.SYNC_METADATA.put(
+                    `hash:${fingerprint.primaryHash}`,
+                    JSON.stringify(taskMapping)
+                  );
+                }
+                
+                results.mappingsCreated++;
+                results.actions.push(`Create mapping for: ${task.content.substring(0, 50)}...`);
+              } catch (error) {
+                results.errors.push({
+                  taskId: task.id,
+                  content: task.content.substring(0, 50),
+                  error: error instanceof Error ? error.message : 'Unknown error'
+                });
+              }
+            }
+          }
+
+          if (direction === 'things_to_todoist') {
+            // This would require AppleScript integration which we can't do from the worker
+            results.actions.push('Things to Todoist sync must be initiated from the client script');
+          }
+
+          return new Response(JSON.stringify({
+            ...results,
+            summary: `Processed ${results.todoistTasks} tasks, cleared ${results.mappingsCleared} mappings, created ${results.mappingsCreated} new mappings`,
+            timestamp: new Date().toISOString()
+          }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({
+            error: 'Bulk sync failed',
+            message: error instanceof Error ? error.message : 'Unknown error',
+            results
           }), {
             status: 500,
             headers: { ...corsHeaders, 'Content-Type': 'application/json' },
