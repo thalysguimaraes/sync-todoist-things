@@ -51,21 +51,32 @@ export class TodoistClient {
     if (excludeSynced && kv) {
       const syncedTasks = new Set<string>();
       
-      // Check KV for synced tasks using new hash-based system
-      for (const task of activeTasks) {
-        const fingerprint = await createTaskFingerprint(task.content, task.description);
-        const mapping = await kv.get(`hash:${fingerprint.primaryHash}`);
+      // Compute fingerprints in parallel
+      const fingerprints = await Promise.all(
+        activeTasks.map(task => createTaskFingerprint(task.content, task.description))
+      );
+      
+      // Check KV for hash mappings in parallel
+      const hashLookups = await Promise.all(
+        fingerprints.map(fp => kv.get(`hash:${fp.primaryHash}`))
+      );
+      
+      hashLookups.forEach((mapping, index) => {
         if (mapping) {
-          syncedTasks.add(task.id);
-          continue;
+          syncedTasks.add(activeTasks[index].id);
         }
-        
-        // Legacy check: look for tasks in mapping by Todoist ID
-        const legacyMapping = await kv.get(`mapping:todoist:${task.id}`);
+      });
+      
+      // Legacy mappings by Todoist ID in parallel
+      const legacyLookups = await Promise.all(
+        activeTasks.map(task => kv.get(`mapping:todoist:${task.id}`))
+      );
+      
+      legacyLookups.forEach((legacyMapping, index) => {
         if (legacyMapping) {
-          syncedTasks.add(task.id);
+          syncedTasks.add(activeTasks[index].id);
         }
-      }
+      });
       
       activeTasks = activeTasks.filter(task => !syncedTasks.has(task.id));
     } else if (excludeSynced && !kv) {
