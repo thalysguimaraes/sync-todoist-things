@@ -87,6 +87,9 @@ on parseTodoistTasks(jsonStr)
         -- Extract fields
         set task_title to my extractValue(itemStr, "title")
         set task_notes to my extractValue(itemStr, "notes")
+        -- Clean up escaped quotes in notes
+        if task_notes is "\\\"\\\"" then set task_notes to ""
+        if task_notes starts with "\\\"" then set task_notes to text 3 thru -3 of task_notes
         set task_due to my extractValue(itemStr, "due")
         set todoist_id to my extractValue(itemStr, "id")
         

@@ -61,17 +61,37 @@ end run
 
 -- Helper function to escape quotes
 on escape_quotes(input_string)
+    set escaped_string to input_string
+    
+    -- Escape backslashes first
+    set AppleScript's text item delimiters to "\\"
+    set string_parts to text items of escaped_string
+    set AppleScript's text item delimiters to "\\\\"
+    set escaped_string to string_parts as string
+    
+    -- Escape quotes
     set AppleScript's text item delimiters to "\""
-    set string_parts to text items of input_string
+    set string_parts to text items of escaped_string
     set AppleScript's text item delimiters to "\\\""
     set escaped_string to string_parts as string
-    set AppleScript's text item delimiters to ""
     
-    -- Also escape newlines
+    -- Escape newlines (both CR and LF)
     set AppleScript's text item delimiters to return
     set string_parts to text items of escaped_string
     set AppleScript's text item delimiters to "\\n"
     set escaped_string to string_parts as string
+    
+    set AppleScript's text item delimiters to linefeed
+    set string_parts to text items of escaped_string
+    set AppleScript's text item delimiters to "\\n"
+    set escaped_string to string_parts as string
+    
+    -- Escape tabs
+    set AppleScript's text item delimiters to tab
+    set string_parts to text items of escaped_string
+    set AppleScript's text item delimiters to "\\t"
+    set escaped_string to string_parts as string
+    
     set AppleScript's text item delimiters to ""
     
     return escaped_string

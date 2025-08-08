@@ -59,6 +59,20 @@ export default {
           });
         }
         
+        // Optional flat format for AppleScript importer compatibility
+        if (format === 'flat') {
+          const flatTasks = enhancedTasks.map(t => ({
+            id: t.id,
+            title: t.content,
+            notes: t.description || '',
+            due: t.due?.datetime || t.due?.date || null,
+            tags: (t.labels || []).filter(l => l !== 'synced-to-things' && l !== 'synced-from-things')
+          }));
+          return new Response(JSON.stringify(flatTasks), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+        
         return new Response(JSON.stringify(thingsTasks), {
           headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         });
@@ -745,6 +759,31 @@ export default {
             error: 'Tag cleanup failed',
             message: error instanceof Error ? error.message : 'Unknown error'
           }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      // Repair: unmark current Todoist inbox tasks as synced (removes fingerprint mappings)
+      if (path === '/inbox/unmark-all' && request.method === 'POST') {
+        try {
+          const tasks = await todoist.getInboxTasks(false, env.SYNC_METADATA); // include all
+          const results = [] as Array<{ id: string; removed: boolean; hash?: string }>;
+          for (const task of tasks) {
+            try {
+              const fingerprint = await createTaskFingerprint(task.content, task.description);
+              await env.SYNC_METADATA.delete(`hash:${fingerprint.primaryHash}`);
+              results.push({ id: task.id, removed: true, hash: fingerprint.primaryHash });
+            } catch {
+              results.push({ id: task.id, removed: false });
+            }
+          }
+          return new Response(JSON.stringify({ count: results.length, results }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({ error: 'Failed to unmark', message: error instanceof Error ? error.message : 'Unknown error' }), {
             status: 500,
             headers: { ...corsHeaders, 'Content-Type': 'application/json' },
           });
