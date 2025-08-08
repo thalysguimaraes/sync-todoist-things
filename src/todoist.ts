@@ -12,21 +12,54 @@ import {
 export class TodoistClient {
   constructor(private env: Env) {}
 
-  async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
-    const response = await fetch(`${this.env.TODOIST_API_URL}${endpoint}`, {
-      ...options,
-      headers: {
-        'Authorization': `Bearer ${this.env.TODOIST_API_TOKEN}`,
-        'Content-Type': 'application/json',
-        ...options.headers,
-      },
-    });
+  private async sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
 
-    if (!response.ok) {
-      throw new Error(`Todoist API error: ${response.status} ${response.statusText}`);
+  async request<T>(endpoint: string, options: RequestInit = {}, retryCount = 0): Promise<T> {
+    const maxRetries = 3;
+    const baseDelay = 1000; // 1 second
+    
+    try {
+      const response = await fetch(`${this.env.TODOIST_API_URL}${endpoint}`, {
+        ...options,
+        headers: {
+          'Authorization': `Bearer ${this.env.TODOIST_API_TOKEN}`,
+          'Content-Type': 'application/json',
+          ...options.headers,
+        },
+      });
+
+      if (response.status === 429 && retryCount < maxRetries) {
+        // Rate limited - exponential backoff with jitter
+        const delay = baseDelay * Math.pow(2, retryCount) + Math.random() * 1000;
+        console.log(`Rate limited, retrying in ${delay}ms (attempt ${retryCount + 1}/${maxRetries})`);
+        await this.sleep(delay);
+        return this.request<T>(endpoint, options, retryCount + 1);
+      }
+
+      if (!response.ok) {
+        // For other errors, retry if transient (5xx errors)
+        if (response.status >= 500 && retryCount < maxRetries) {
+          const delay = baseDelay * Math.pow(2, retryCount);
+          console.log(`Server error ${response.status}, retrying in ${delay}ms`);
+          await this.sleep(delay);
+          return this.request<T>(endpoint, options, retryCount + 1);
+        }
+        throw new Error(`Todoist API error: ${response.status} ${response.statusText}`);
+      }
+
+      return response.json();
+    } catch (error) {
+      // Network errors - retry with backoff
+      if (retryCount < maxRetries) {
+        const delay = baseDelay * Math.pow(2, retryCount);
+        console.log(`Network error, retrying in ${delay}ms:`, error);
+        await this.sleep(delay);
+        return this.request<T>(endpoint, options, retryCount + 1);
+      }
+      throw error;
     }
-
-    return response.json();
   }
 
   async getProjects(): Promise<TodoistProject[]> {
