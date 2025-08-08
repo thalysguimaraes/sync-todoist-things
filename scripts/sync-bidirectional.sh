@@ -13,8 +13,52 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
 }
 
+# Function to check if Things is running
+check_things_running() {
+    if ! osascript -e 'tell application "System Events" to (name of processes) contains "Things3"' 2>/dev/null | grep -q "true"; then
+        log "ERROR: Things3 is not running. Please open Things3 and try again."
+        echo "ERROR: Things3 is not running. Please open Things3 and try again."
+        exit 1
+    fi
+}
+
+# Function to run AppleScript with timeout and retry
+run_applescript() {
+    local script_path="$1"
+    local args="${2:-}"
+    local max_retries=3
+    local retry_count=0
+    local timeout_seconds=30
+    
+    while [ $retry_count -lt $max_retries ]; do
+        if [ -n "$args" ]; then
+            result=$(timeout $timeout_seconds "$script_path" "$args" 2>&1)
+        else
+            result=$(timeout $timeout_seconds "$script_path" 2>&1)
+        fi
+        
+        if [ $? -eq 0 ]; then
+            echo "$result"
+            return 0
+        elif [ $? -eq 124 ]; then
+            log "WARNING: AppleScript timed out after ${timeout_seconds}s (attempt $((retry_count + 1))/$max_retries)"
+            retry_count=$((retry_count + 1))
+            sleep 2
+        else
+            log "ERROR: AppleScript failed: $result"
+            return 1
+        fi
+    done
+    
+    log "ERROR: AppleScript failed after $max_retries attempts"
+    return 1
+}
+
 # Start bidirectional sync
 log "Starting bidirectional sync..."
+
+# Check if Things is running
+check_things_running
 
 # STEP 1: Sync from Todoist to Things
 log "Step 1: Syncing from Todoist → Things"
@@ -39,8 +83,12 @@ if [ "$todoist_count" -gt 0 ] 2>/dev/null; then
     todoist_tasks=$(curl -s "${WORKER_URL}/inbox?format=flat&include_all=false")
     
     # Import tasks using AppleScript with duplicate prevention
-    import_result=$("${SCRIPT_DIR}/import-todoist-tasks.applescript" "$todoist_tasks" 2>&1)
-    log "Import result: $import_result"
+    import_result=$(run_applescript "${SCRIPT_DIR}/import-todoist-tasks.applescript" "$todoist_tasks")
+    if [ $? -ne 0 ]; then
+        log "ERROR: Failed to import tasks to Things"
+    else
+        log "Import result: $import_result"
+    fi
     
     # Mark as synced in Todoist only if at least one task was imported
     imported_num=$(echo "$import_result" | sed -n 's/.*Imported \([0-9][0-9]*\) tasks.*/\1/p')
@@ -58,7 +106,7 @@ fi
 log "Step 2: Syncing from Things → Todoist"
 
 # Read tasks from Things inbox using AppleScript
-things_tasks=$("${SCRIPT_DIR}/read-things-inbox.applescript" 2>/dev/null)
+things_tasks=$(run_applescript "${SCRIPT_DIR}/read-things-inbox.applescript")
 
 if [ $? -ne 0 ] || [ -z "$things_tasks" ] || [ "$things_tasks" = "[]" ]; then
     log "No new tasks in Things to sync"

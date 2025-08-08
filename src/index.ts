@@ -772,23 +772,159 @@ export default {
 
       // Repair: unmark current Todoist inbox tasks as synced (removes fingerprint mappings)
       if (path === '/inbox/unmark-all' && request.method === 'POST') {
+        // Require auth header for dangerous operations
+        const authHeader = request.headers.get('X-Repair-Auth');
+        if (authHeader !== env.REPAIR_AUTH_TOKEN) {
+          return new Response(JSON.stringify({ error: 'Unauthorized', message: 'Missing or invalid X-Repair-Auth header' }), {
+            status: 401,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+        
+        // Check for dry-run mode
+        const isDryRun = url.searchParams.get('dry_run') === 'true';
+        
         try {
           const tasks = await todoist.getInboxTasks(false, env.SYNC_METADATA); // include all
-          const results = [] as Array<{ id: string; removed: boolean; hash?: string }>;
+          const results = [] as Array<{ id: string; removed: boolean; hash?: string; title?: string }>;
+          
           for (const task of tasks) {
             try {
               const fingerprint = await createTaskFingerprint(task.content, task.description);
-              await env.SYNC_METADATA.delete(`hash:${fingerprint.primaryHash}`);
-              results.push({ id: task.id, removed: true, hash: fingerprint.primaryHash });
+              
+              if (isDryRun) {
+                // In dry-run, just check if mapping exists
+                const mapping = await env.SYNC_METADATA.get(`hash:${fingerprint.primaryHash}`);
+                results.push({ 
+                  id: task.id, 
+                  removed: false, 
+                  hash: fingerprint.primaryHash,
+                  title: task.content,
+                  wouldRemove: !!mapping
+                });
+              } else {
+                // Actually delete the mapping
+                await env.SYNC_METADATA.delete(`hash:${fingerprint.primaryHash}`);
+                results.push({ 
+                  id: task.id, 
+                  removed: true, 
+                  hash: fingerprint.primaryHash,
+                  title: task.content 
+                });
+              }
             } catch {
               results.push({ id: task.id, removed: false });
             }
           }
-          return new Response(JSON.stringify({ count: results.length, results }), {
+          
+          return new Response(JSON.stringify({ 
+            count: results.length, 
+            results,
+            mode: isDryRun ? 'dry_run' : 'executed'
+          }), {
             headers: { ...corsHeaders, 'Content-Type': 'application/json' },
           });
         } catch (error) {
           return new Response(JSON.stringify({ error: 'Failed to unmark', message: error instanceof Error ? error.message : 'Unknown error' }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+      
+      // Per-task unmark endpoint
+      if (path.startsWith('/inbox/unmark/') && request.method === 'POST') {
+        const taskId = path.split('/')[3];
+        
+        // Require auth header
+        const authHeader = request.headers.get('X-Repair-Auth');
+        if (authHeader !== env.REPAIR_AUTH_TOKEN) {
+          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+            status: 401,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+        
+        try {
+          const task = await todoist.request<TodoistTask>(`/tasks/${taskId}`);
+          const fingerprint = await createTaskFingerprint(task.content, task.description);
+          await env.SYNC_METADATA.delete(`hash:${fingerprint.primaryHash}`);
+          
+          return new Response(JSON.stringify({ 
+            id: taskId,
+            removed: true,
+            hash: fingerprint.primaryHash 
+          }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({ 
+            error: 'Failed to unmark task',
+            message: error instanceof Error ? error.message : 'Unknown error' 
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      // Debug endpoint: read single KV mapping
+      if (path.startsWith('/debug/kv/') && request.method === 'GET') {
+        const key = decodeURIComponent(path.substring(10));
+        
+        try {
+          const value = await env.SYNC_METADATA.get(key);
+          if (!value) {
+            return new Response(JSON.stringify({ key, value: null, exists: false }), {
+              status: 404,
+              headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+            });
+          }
+          
+          try {
+            const parsed = JSON.parse(value);
+            return new Response(JSON.stringify({ key, value: parsed, exists: true }), {
+              headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+            });
+          } catch {
+            return new Response(JSON.stringify({ key, value, exists: true }), {
+              headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+            });
+          }
+        } catch (error) {
+          return new Response(JSON.stringify({ 
+            error: 'Failed to read KV',
+            message: error instanceof Error ? error.message : 'Unknown error' 
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+      
+      // Debug endpoint: preview hash computation
+      if (path === '/debug/hash' && request.method === 'GET') {
+        const title = url.searchParams.get('title') || '';
+        const notes = url.searchParams.get('notes') || '';
+        const due = url.searchParams.get('due') || '';
+        
+        try {
+          const fingerprint = await createTaskFingerprint(title, notes, due);
+          const hashMapping = await env.SYNC_METADATA.get(`hash:${fingerprint.primaryHash}`);
+          
+          return new Response(JSON.stringify({
+            input: { title, notes, due },
+            fingerprint,
+            hashKey: `hash:${fingerprint.primaryHash}`,
+            existingMapping: hashMapping ? JSON.parse(hashMapping) : null
+          }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({ 
+            error: 'Failed to compute hash',
+            message: error instanceof Error ? error.message : 'Unknown error' 
+          }), {
             status: 500,
             headers: { ...corsHeaders, 'Content-Type': 'application/json' },
           });
@@ -873,6 +1009,116 @@ export default {
         } catch (error) {
           return new Response(JSON.stringify({
             error: 'Debug analysis failed',
+            message: error instanceof Error ? error.message : 'Unknown error'
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      // Consistency check endpoint
+      if (path === '/sync/verify' && request.method === 'GET') {
+        try {
+          const discrepancies = [];
+          const recommendations = [];
+          
+          // Get all Todoist tasks
+          const todoistTasks = await todoist.getInboxTasks(false, env.SYNC_METADATA);
+          
+          // Get all hash mappings
+          const hashList = await env.SYNC_METADATA.list({ prefix: 'hash:' });
+          const hashMappings = new Map<string, TaskMapping>();
+          
+          for (const key of hashList.keys) {
+            const mapping = await env.SYNC_METADATA.get(key.name);
+            if (mapping) {
+              hashMappings.set(key.name, JSON.parse(mapping) as TaskMapping);
+            }
+          }
+          
+          // Check for orphaned mappings (mappings without corresponding Todoist tasks)
+          for (const [hashKey, mapping] of hashMappings) {
+            const taskExists = todoistTasks.some(t => t.id === mapping.todoistId);
+            if (!taskExists) {
+              discrepancies.push({
+                type: 'orphaned_mapping',
+                hashKey,
+                todoistId: mapping.todoistId,
+                thingsId: mapping.thingsId
+              });
+              recommendations.push(`Remove orphaned mapping: DELETE ${hashKey}`);
+            }
+          }
+          
+          // Check for Todoist tasks without proper mappings
+          for (const task of todoistTasks) {
+            const fingerprint = await createTaskFingerprint(task.content, task.description);
+            const hashKey = `hash:${fingerprint.primaryHash}`;
+            const mapping = hashMappings.get(hashKey);
+            
+            if (!mapping) {
+              // Check if task has Things ID in description
+              const thingsId = extractThingsIdFromNotes(task.description || '');
+              if (thingsId) {
+                discrepancies.push({
+                  type: 'missing_hash_mapping',
+                  todoistId: task.id,
+                  title: task.content,
+                  thingsId,
+                  hashKey
+                });
+                recommendations.push(`Create mapping for task "${task.content}"`);
+              }
+            } else {
+              // Check if Things ID in description matches mapping
+              const thingsIdInNotes = extractThingsIdFromNotes(task.description || '');
+              if (thingsIdInNotes && thingsIdInNotes !== mapping.thingsId) {
+                discrepancies.push({
+                  type: 'mismatched_things_id',
+                  todoistId: task.id,
+                  title: task.content,
+                  thingsIdInNotes,
+                  thingsIdInMapping: mapping.thingsId
+                });
+                recommendations.push(`Fix Things ID mismatch for "${task.content}"`);
+              }
+            }
+            
+            // Check for duplicate sync tags
+            const hasSyncTags = task.labels.some(l => 
+              l === 'synced-to-things' || l === 'synced-from-things'
+            );
+            if (hasSyncTags && mapping) {
+              discrepancies.push({
+                type: 'unnecessary_sync_tags',
+                todoistId: task.id,
+                title: task.content,
+                labels: task.labels
+              });
+              recommendations.push(`Remove sync tags from "${task.content}" (already tracked by fingerprint)`);
+            }
+          }
+          
+          // Summary
+          const summary = {
+            todoistTaskCount: todoistTasks.length,
+            hashMappingCount: hashMappings.size,
+            discrepancyCount: discrepancies.length,
+            isHealthy: discrepancies.length === 0
+          };
+          
+          return new Response(JSON.stringify({
+            summary,
+            discrepancies,
+            recommendations,
+            timestamp: new Date().toISOString()
+          }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({
+            error: 'Verification failed',
             message: error instanceof Error ? error.message : 'Unknown error'
           }), {
             status: 500,
