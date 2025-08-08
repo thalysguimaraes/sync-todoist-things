@@ -8,7 +8,8 @@ import {
   SyncConflict,
   ConflictResolutionStrategy,
   SyncConfig,
-  TodoistTask
+  TodoistTask,
+  ScheduledEvent
 } from './types';
 import { TodoistClient } from './todoist';
 import { convertToThingsFormat, generateThingsUrl } from './things';
@@ -23,6 +24,83 @@ import {
 import { MetricsTracker } from './metrics';
 import { ConflictResolver } from './conflicts';
 import { ConfigManager } from './config';
+import { WebhookDispatcher } from './webhooks/dispatcher';
+import { WebhookSource, OutboundWebhookPayload, OutboundWebhookEvent } from './webhooks/types';
+
+// Helper function to send outbound webhooks
+async function sendOutboundWebhook(
+  env: Env,
+  event: OutboundWebhookEvent,
+  data: any
+): Promise<void> {
+  try {
+    const subscribers = await env.SYNC_METADATA.get('outbound-webhooks');
+    if (!subscribers) return;
+
+    const webhookSubscribers = JSON.parse(subscribers);
+    
+    for (const subscriber of webhookSubscribers) {
+      if (subscriber.enabled && subscriber.events.includes(event)) {
+        const payload: OutboundWebhookPayload = {
+          event,
+          timestamp: new Date().toISOString(),
+          data
+        };
+
+        // Add signature if secret is configured
+        if (subscriber.secret) {
+          const hmac = await crypto.subtle.importKey(
+            'raw',
+            new TextEncoder().encode(subscriber.secret),
+            { name: 'HMAC', hash: 'SHA-256' },
+            false,
+            ['sign']
+          );
+          const signature = await crypto.subtle.sign(
+            'HMAC', 
+            hmac, 
+            new TextEncoder().encode(JSON.stringify(payload))
+          );
+          payload.signature = Array.from(new Uint8Array(signature))
+            .map(b => b.toString(16).padStart(2, '0'))
+            .join('');
+        }
+
+        // Send webhook (fire and forget)
+        fetch(subscriber.url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'User-Agent': 'Todoist-Things-Sync/1.0'
+          },
+          body: JSON.stringify(payload)
+        }).catch(error => {
+          console.error(`Webhook delivery failed to ${subscriber.url}:`, error);
+          
+          // Store delivery failure for monitoring
+          const delivery = {
+            id: `delivery-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+            webhookUrl: subscriber.url,
+            event,
+            payload,
+            status: 'failed',
+            attempts: 1,
+            error: error.message,
+            createdAt: new Date().toISOString()
+          };
+
+          env.SYNC_METADATA.put(
+            `webhook-delivery:${delivery.id}`, 
+            JSON.stringify(delivery),
+            { expirationTtl: 86400 } // Keep for 24 hours
+          ).catch(console.error);
+        });
+      }
+    }
+  } catch (error) {
+    console.error('Outbound webhook error:', error);
+  }
+}
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -42,6 +120,13 @@ export default {
     try {
       const todoist = new TodoistClient(env);
       const metrics = new MetricsTracker(env);
+
+      // Webhook processing endpoints (for actual webhook events)
+      if (path.startsWith('/webhook/') && ['github', 'notion', 'slack', 'generic'].includes(path.split('/')[2])) {
+        const webhookDispatcher = new WebhookDispatcher(env);
+        const source = path.split('/')[2] as WebhookSource;
+        return await webhookDispatcher.processWebhook(source, request);
+      }
 
       if (path === '/inbox' && request.method === 'GET') {
         // Get tasks, excluding already synced ones by default
@@ -542,6 +627,41 @@ export default {
               conflictsResolved
             }
           });
+
+          // Send outbound webhooks for sync events
+          if (created > 0 || conflictsResolved > 0) {
+            await sendOutboundWebhook(env, 'task_synced', {
+              source: 'things',
+              target: 'todoist',
+              tasksCreated: created,
+              conflictsResolved,
+              summary: { created, existing, errors, conflictsDetected, conflictsResolved, total: results.length }
+            });
+          }
+
+          if (conflictsDetected > 0 && conflictsResolved < conflictsDetected) {
+            await sendOutboundWebhook(env, 'conflict_detected', {
+              source: 'things',
+              target: 'todoist',
+              unresolvedConflicts: conflictsDetected - conflictsResolved,
+              totalConflicts: conflictsDetected
+            });
+          }
+
+          if (errors === 0) {
+            await sendOutboundWebhook(env, 'sync_completed', {
+              source: 'things',
+              target: 'todoist',
+              metrics: { created, existing, errors, conflictsDetected, conflictsResolved, total: results.length }
+            });
+          } else {
+            await sendOutboundWebhook(env, 'sync_failed', {
+              source: 'things',
+              target: 'todoist',
+              errors,
+              metrics: { created, existing, errors, conflictsDetected, conflictsResolved, total: results.length }
+            });
+          }
 
           // Store idempotency record if request ID provided
           if (requestId) {
@@ -1729,6 +1849,345 @@ export default {
         }
       }
 
+      // Webhook configuration endpoints
+      if (path === '/webhook/config' && request.method === 'GET') {
+        try {
+          const config = await env.SYNC_METADATA.get('webhook-config');
+          return new Response(config || '{}', {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({
+            error: 'Failed to get webhook configuration',
+            message: error instanceof Error ? error.message : 'Unknown error'
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      if (path === '/webhook/config' && request.method === 'PUT') {
+        try {
+          const config = await request.json();
+          
+          // Basic validation
+          if (typeof config !== 'object' || !config.sources) {
+            return new Response(JSON.stringify({
+              error: 'Invalid webhook configuration'
+            }), {
+              status: 400,
+              headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+            });
+          }
+
+          await env.SYNC_METADATA.put('webhook-config', JSON.stringify(config));
+          
+          return new Response(JSON.stringify({
+            success: true,
+            message: 'Webhook configuration updated'
+          }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({
+            error: 'Failed to update webhook configuration',
+            message: error instanceof Error ? error.message : 'Unknown error'
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      if (path === '/webhook/test' && request.method === 'POST') {
+        try {
+          const body = await request.json();
+          const { source, payload } = body;
+          
+          if (!source || !payload) {
+            return new Response(JSON.stringify({
+              error: 'Missing source or payload'
+            }), {
+              status: 400,
+              headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+            });
+          }
+
+          // Create test webhook request
+          const testRequest = new Request(request.url, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Test-Webhook': 'true'
+            },
+            body: JSON.stringify(payload)
+          });
+
+          const webhookDispatcher = new WebhookDispatcher(env);
+          const result = await webhookDispatcher.processWebhook(source as WebhookSource, testRequest);
+          
+          return new Response(JSON.stringify({
+            testResult: await result.json(),
+            status: result.status
+          }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({
+            error: 'Webhook test failed',
+            message: error instanceof Error ? error.message : 'Unknown error'
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      // Outbound webhook management endpoints
+      if (path === '/webhook/subscribers' && request.method === 'GET') {
+        try {
+          const subscribers = await env.SYNC_METADATA.get('outbound-webhooks');
+          return new Response(subscribers || '[]', {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({
+            error: 'Failed to get webhook subscribers',
+            message: error instanceof Error ? error.message : 'Unknown error'
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      if (path === '/webhook/subscribers' && request.method === 'POST') {
+        try {
+          const subscriber = await request.json();
+          
+          // Validate subscriber
+          if (!subscriber.url || !Array.isArray(subscriber.events)) {
+            return new Response(JSON.stringify({
+              error: 'Invalid subscriber: url and events array required'
+            }), {
+              status: 400,
+              headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+            });
+          }
+
+          // Get existing subscribers
+          const existingData = await env.SYNC_METADATA.get('outbound-webhooks');
+          const subscribers = existingData ? JSON.parse(existingData) : [];
+
+          // Add new subscriber
+          const newSubscriber = {
+            id: `sub-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+            url: subscriber.url,
+            secret: subscriber.secret || null,
+            events: subscriber.events,
+            enabled: subscriber.enabled !== false,
+            createdAt: new Date().toISOString(),
+            retryPolicy: subscriber.retryPolicy || {
+              enabled: true,
+              maxRetries: 3,
+              backoffMs: 1000
+            }
+          };
+
+          subscribers.push(newSubscriber);
+          await env.SYNC_METADATA.put('outbound-webhooks', JSON.stringify(subscribers));
+
+          return new Response(JSON.stringify({
+            success: true,
+            subscriber: newSubscriber
+          }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({
+            error: 'Failed to add webhook subscriber',
+            message: error instanceof Error ? error.message : 'Unknown error'
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      if (path.startsWith('/webhook/subscribers/') && request.method === 'DELETE') {
+        try {
+          const subscriberId = path.split('/')[3];
+          
+          const existingData = await env.SYNC_METADATA.get('outbound-webhooks');
+          const subscribers = existingData ? JSON.parse(existingData) : [];
+          
+          const updatedSubscribers = subscribers.filter((s: any) => s.id !== subscriberId);
+          
+          if (subscribers.length === updatedSubscribers.length) {
+            return new Response(JSON.stringify({
+              error: 'Subscriber not found'
+            }), {
+              status: 404,
+              headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+            });
+          }
+
+          await env.SYNC_METADATA.put('outbound-webhooks', JSON.stringify(updatedSubscribers));
+
+          return new Response(JSON.stringify({
+            success: true,
+            message: 'Subscriber deleted'
+          }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({
+            error: 'Failed to delete webhook subscriber',
+            message: error instanceof Error ? error.message : 'Unknown error'
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      if (path === '/webhook/deliveries' && request.method === 'GET') {
+        try {
+          const hours = parseInt(url.searchParams.get('hours') || '24');
+          const deliveries = await env.SYNC_METADATA.list({ prefix: 'webhook-delivery:' });
+          const results = [];
+          const cutoffTime = Date.now() - (hours * 60 * 60 * 1000);
+
+          for (const key of deliveries.keys) {
+            try {
+              const delivery = await env.SYNC_METADATA.get(key.name);
+              if (delivery) {
+                const deliveryData = JSON.parse(delivery);
+                if (new Date(deliveryData.createdAt).getTime() > cutoffTime) {
+                  results.push(deliveryData);
+                }
+              }
+            } catch {
+              // Skip invalid entries
+            }
+          }
+
+          // Sort by creation time (newest first)
+          results.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+          return new Response(JSON.stringify({
+            deliveries: results,
+            count: results.length,
+            timeRangeHours: hours
+          }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({
+            error: 'Failed to get webhook deliveries',
+            message: error instanceof Error ? error.message : 'Unknown error'
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      // Sync coordination endpoints for CF Workers ↔ Local Script communication
+      if (path === '/sync/requests' && request.method === 'GET') {
+        try {
+          const syncRequests = await env.SYNC_METADATA.list({ prefix: 'sync-request:' });
+          const requests = [];
+          
+          for (const key of syncRequests.keys) {
+            const request = await env.SYNC_METADATA.get(key.name);
+            if (request) {
+              requests.push(JSON.parse(request));
+            }
+          }
+          
+          return new Response(JSON.stringify({
+            requests: requests.filter(r => r.status === 'pending'),
+            count: requests.length,
+            timestamp: new Date().toISOString()
+          }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({
+            error: 'Failed to get sync requests',
+            message: error instanceof Error ? error.message : 'Unknown error'
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      if (path === '/sync/respond' && request.method === 'POST') {
+        try {
+          const body = await request.json() as {
+            requestId?: string;
+            type: string;
+            status: string;
+            tasksProcessed?: number;
+            errors?: number;
+            message?: string;
+          };
+          
+          const response = {
+            id: `response-${Date.now()}`,
+            ...body,
+            timestamp: new Date().toISOString()
+          };
+          
+          // Store sync response for coordination
+          await env.SYNC_METADATA.put(`sync-response:${response.id}`, JSON.stringify(response));
+          
+          // If responding to a specific request, mark it as completed
+          if (body.requestId) {
+            const requestKey = `sync-request:${body.requestId}`;
+            const requestData = await env.SYNC_METADATA.get(requestKey);
+            if (requestData) {
+              const request = JSON.parse(requestData);
+              request.status = body.status;
+              request.completedAt = new Date().toISOString();
+              await env.SYNC_METADATA.put(requestKey, JSON.stringify(request));
+            }
+          }
+          
+          // Record sync response metric
+          await metrics.recordMetric({
+            timestamp: new Date().toISOString(),
+            type: 'sync_response',
+            success: body.status === 'completed',
+            duration: 0,
+            details: {
+              responseType: body.type,
+              tasksProcessed: body.tasksProcessed || 0,
+              errors: body.errors || 0
+            }
+          });
+          
+          return new Response(JSON.stringify({
+            received: true,
+            responseId: response.id,
+            timestamp: new Date().toISOString()
+          }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({
+            error: 'Failed to process sync response',
+            message: error instanceof Error ? error.message : 'Unknown error'
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
       if (path === '/health' && request.method === 'GET') {
         return new Response(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString() }), {
           headers: { ...corsHeaders, 'Content-Type': 'application/json' },
@@ -1750,4 +2209,147 @@ export default {
       });
     }
   },
+
+  async scheduled(event: ScheduledEvent, env: Env): Promise<void> {
+    // CF Workers cron-triggered sync - runs every 2 minutes
+    console.log('Starting cron-triggered bidirectional sync at:', new Date().toISOString());
+    
+    const metrics = new MetricsTracker(env);
+    const startTime = Date.now();
+    
+    try {
+      // Check if sync is already locked to prevent concurrent syncs
+      const lockKey = 'sync:lock';
+      const lockData = await env.SYNC_METADATA.get(lockKey);
+      
+      if (lockData) {
+        const lock = JSON.parse(lockData);
+        const lockAge = Date.now() - lock.timestamp;
+        
+        // If lock is less than 2 minutes old, skip this sync
+        if (lockAge < 120000) {
+          console.log('Sync already in progress, skipping cron trigger');
+          return;
+        }
+        
+        // Lock is stale, clear it
+        await env.SYNC_METADATA.delete(lockKey);
+      }
+      
+      // Acquire sync lock
+      await acquireSyncLock(env.SYNC_METADATA);
+      
+      // STEP 1: Todoist → Things coordination
+      // Check if there are new tasks in Todoist that need syncing
+      const todoist = new TodoistClient(env);
+      const newTodoistTasks = await todoist.getInboxTasks(true, env.SYNC_METADATA);
+      
+      if (newTodoistTasks.length > 0) {
+        console.log(`Found ${newTodoistTasks.length} new Todoist tasks to sync to Things`);
+        
+        // Create a sync request for local script to process
+        const syncRequest = {
+          id: `cron-sync-${Date.now()}`,
+          timestamp: new Date().toISOString(),
+          type: 'todoist_to_things',
+          tasks: newTodoistTasks.length,
+          status: 'pending'
+        };
+        
+        await env.SYNC_METADATA.put(`sync-request:${syncRequest.id}`, JSON.stringify(syncRequest));
+        
+        // Record metric for coordination
+        await metrics.recordMetric({
+          timestamp: new Date().toISOString(),
+          type: 'sync_coordination',
+          success: true,
+          duration: Date.now() - startTime,
+          details: {
+            direction: 'todoist_to_things',
+            tasksFound: newTodoistTasks.length,
+            requestId: syncRequest.id
+          }
+        });
+      }
+      
+      // STEP 2: Check for Things sync requests from local scripts
+      // This allows the local AppleScript to communicate back to CF Workers
+      const syncRequests = await env.SYNC_METADATA.list({ prefix: 'sync-response:' });
+      for (const key of syncRequests.keys) {
+        try {
+          const response = await env.SYNC_METADATA.get(key.name);
+          if (response) {
+            const syncResponse = JSON.parse(response);
+            
+            // Process the sync response from local script
+            if (syncResponse.type === 'things_to_todoist' && syncResponse.status === 'completed') {
+              console.log(`Processing sync response: ${syncResponse.tasksProcessed} tasks from Things`);
+              
+              // Clean up processed sync response
+              await env.SYNC_METADATA.delete(key.name);
+            }
+          }
+        } catch (error) {
+          console.error('Error processing sync response:', error);
+        }
+      }
+      
+      // STEP 3: Cleanup old sync requests
+      const oldRequests = await env.SYNC_METADATA.list({ prefix: 'sync-request:' });
+      const cutoffTime = Date.now() - (10 * 60 * 1000); // 10 minutes ago
+      
+      for (const key of oldRequests.keys) {
+        try {
+          const request = await env.SYNC_METADATA.get(key.name);
+          if (request) {
+            const syncRequest = JSON.parse(request);
+            if (new Date(syncRequest.timestamp).getTime() < cutoffTime) {
+              await env.SYNC_METADATA.delete(key.name);
+            }
+          }
+        } catch (error) {
+          console.error('Error cleaning up old sync request:', error);
+        }
+      }
+      
+      // Release sync lock
+      await releaseSyncLock(env.SYNC_METADATA);
+      
+      await metrics.recordMetric({
+        timestamp: new Date().toISOString(),
+        type: 'cron_sync',
+        success: true,
+        duration: Date.now() - startTime,
+        details: {
+          source: 'cf_workers_cron',
+          cronPattern: '*/2 * * * *',
+          scheduledTime: new Date(event.scheduledTime).toISOString(),
+          todoistTasksFound: newTodoistTasks?.length || 0
+        }
+      });
+      
+      console.log('Cron sync coordination completed successfully');
+    } catch (error) {
+      console.error('Cron sync failed:', error);
+      
+      // Ensure sync lock is released on error
+      try {
+        await releaseSyncLock(env.SYNC_METADATA);
+      } catch (lockError) {
+        console.error('Failed to release sync lock:', lockError);
+      }
+      
+      await metrics.recordMetric({
+        timestamp: new Date().toISOString(),
+        type: 'cron_sync',
+        success: false,
+        duration: Date.now() - startTime,
+        details: {
+          source: 'cf_workers_cron',
+          scheduledTime: new Date(event.scheduledTime).toISOString()
+        },
+        errorMessage: error instanceof Error ? error.message : 'Unknown error'
+      });
+    }
+  }
 };

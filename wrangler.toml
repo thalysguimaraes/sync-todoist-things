@@ -13,3 +13,7 @@ binding = "SYNC_METADATA"
 id = "63e1a66560e24129bfe0915501554381"
 
 # Run `wrangler secret put TODOIST_API_TOKEN` to set your token
+
+# Cron triggers for scheduled sync operations
+[triggers]
+crons = ["*/2 * * * *"]  # Run every 2 minutes
