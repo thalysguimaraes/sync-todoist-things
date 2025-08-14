@@ -5,7 +5,7 @@ compatibility_date = "2025-07-25"
 [vars]
 TODOIST_API_URL = "https://api.todoist.com/rest/v2"
 # Generate a secure token with: openssl rand -hex 32
-REPAIR_AUTH_TOKEN = "0e46c0c05c13b4d62991c3968b375c64c0dd6aba4470d505d305baa3112c052b"
+REPAIR_AUTH_TOKEN = "86143aa681404dde9c74103a78ce2fbcd8a1cd2cd7bf908b42395f369e90c436"
 
 # KV namespace for storing sync metadata and ID mappings
 [[kv_namespaces]]
