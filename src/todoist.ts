@@ -6,8 +6,10 @@ import {
   generateContentHash,
   createTaskFingerprint,
   generateRobustHash,
-  generateTitleVariations
+  generateTitleVariations,
+  extractThingsIdFromNotes
 } from './utils';
+import { BatchSyncManager } from './batch-sync';
 
 export class TodoistClient {
   constructor(private env: Env) {}
@@ -80,25 +82,32 @@ export class TodoistClient {
     const tasks = await this.request<TodoistTask[]>(`/tasks?project_id=${inboxProject.id}`);
     let activeTasks = tasks.filter(task => !task.is_completed);
     
-    // If fingerprint-based exclusion is requested and KV is available
-    if (excludeSynced && kv) {
+    // First, filter by label - this is free and doesn't use KV
+    if (excludeSynced) {
+      activeTasks = activeTasks.filter(task => {
+        // Check if task has the synced label
+        const hasSyncedLabel = task.labels.includes('synced-to-things') || 
+                               task.labels.includes('synced-from-things');
+        // Also check if Things ID is in the description
+        const hasThingsId = !!extractThingsIdFromNotes(task.description || '');
+        return !hasSyncedLabel && !hasThingsId;
+      });
+    }
+    
+    // If KV is available and we still have tasks, do fingerprint check using batch state
+    if (excludeSynced && kv && activeTasks.length > 0) {
+      const batchSync = new BatchSyncManager({ SYNC_METADATA: kv } as Env);
+      await batchSync.loadState();
+      
       const syncedTasks = new Set<string>();
       
-      // Compute fingerprints in parallel
-      const fingerprints = await Promise.all(
-        activeTasks.map(task => createTaskFingerprint(task.content, task.description))
-      );
-      
-      // Check KV for hash mappings in parallel
-      const hashLookups = await Promise.all(
-        fingerprints.map(fp => kv.get(`hash:${fp.primaryHash}`))
-      );
-      
-      hashLookups.forEach((mapping, index) => {
-        if (mapping) {
-          syncedTasks.add(activeTasks[index].id);
+      // Check fingerprints against batch state
+      for (const task of activeTasks) {
+        const fingerprint = await createTaskFingerprint(task.content, task.description);
+        if (await batchSync.hasMapping(fingerprint.primaryHash)) {
+          syncedTasks.add(task.id);
         }
-      });
+      }
       
       // Legacy mappings by Todoist ID in parallel
       const legacyLookups = await Promise.all(
@@ -193,38 +202,33 @@ export class TodoistClient {
   ): Promise<TaskMapping | null> {
     if (!kv) return null;
 
+    // Use batch sync manager for efficient lookups
+    const batchSync = new BatchSyncManager({ SYNC_METADATA: kv } as Env);
+    await batchSync.loadState();
+
     // Create fingerprint for the incoming task
     const fingerprint = await createTaskFingerprint(title, notes, due);
 
-    // 1. Try exact hash lookup first (fastest)
-    let mapping = await kv.get(`hash:${fingerprint.primaryHash}`);
+    // 1. Try exact hash lookup first (fastest) - from batch state
+    let mapping = await batchSync.getMapping(fingerprint.primaryHash);
     if (mapping) {
-      const taskMapping = JSON.parse(mapping) as TaskMapping;
-      return { ...taskMapping, source: 'hash' };
+      return { ...mapping, source: 'hash' };
     }
 
-    // 2. Check legacy mapping by Things ID
+    // 2. Check by Things ID if available - from batch state
     if (thingsId) {
-      const legacyMapping = await kv.get(`mapping:things:${thingsId}`);
-      if (legacyMapping) {
-        const metadata = JSON.parse(legacyMapping) as SyncMetadata;
-        return {
-          todoistId: metadata.todoistId,
-          thingsId: metadata.thingsId,
-          fingerprint,
-          lastSynced: metadata.lastSynced,
-          source: 'legacy'
-        };
+      mapping = await batchSync.getMappingByThingsId(thingsId);
+      if (mapping) {
+        return { ...mapping, source: 'legacy' };
       }
     }
 
-    // 3. Try title variations
+    // 3. Try title variations - from batch state
     for (const titleVariation of fingerprint.titleVariations) {
       const variationHash = await generateRobustHash(titleVariation, notes, due);
-      mapping = await kv.get(`hash:${variationHash}`);
+      mapping = await batchSync.getMapping(variationHash);
       if (mapping) {
-        const taskMapping = JSON.parse(mapping) as TaskMapping;
-        return { ...taskMapping, source: 'fuzzy' };
+        return { ...mapping, source: 'fuzzy' };
       }
     }
 
@@ -302,6 +306,13 @@ export class TodoistClient {
     await this.request(`/tasks/${taskId}`, {
       method: 'POST',
       body: JSON.stringify({ description: updatedDescription }),
+    });
+  }
+
+  async updateTaskLabels(taskId: string, labels: string[]): Promise<void> {
+    await this.request(`/tasks/${taskId}`, {
+      method: 'POST',
+      body: JSON.stringify({ labels }),
     });
   }
 

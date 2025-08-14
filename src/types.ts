@@ -164,3 +164,17 @@ export interface SyncConfig {
   autoResolveConflicts: boolean;
   syncInterval?: number;
 }
+
+export interface BatchSyncState {
+  version: number;
+  lastUpdated: string;
+  mappings: {
+    [fingerprint: string]: TaskMapping;
+  };
+  todoistIndex: {
+    [todoistId: string]: string; // Points to fingerprint
+  };
+  thingsIndex: {
+    [thingsId: string]: string; // Points to fingerprint
+  };
+}

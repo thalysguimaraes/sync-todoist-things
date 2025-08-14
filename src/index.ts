@@ -9,8 +9,10 @@ import {
   ConflictResolutionStrategy,
   SyncConfig,
   TodoistTask,
-  ScheduledEvent
+  ScheduledEvent,
+  BatchSyncState
 } from './types';
+import { BatchSyncManager } from './batch-sync';
 import { TodoistClient } from './todoist';
 import { convertToThingsFormat, generateThingsUrl } from './things';
 import { 
@@ -191,6 +193,9 @@ export default {
       }
 
       if (path === '/inbox/mark-synced' && request.method === 'POST') {
+        // Initialize batch sync manager
+        const batchSync = new BatchSyncManager(env);
+        
         // Check for idempotency
         const requestId = request.headers.get('X-Request-Id');
         if (requestId) {
@@ -211,7 +216,7 @@ export default {
           }
         }
         
-        // Mark tasks as synced using fingerprint-based tracking
+        // Mark tasks as synced using batch operations
         const tasks = await todoist.getInboxTasks(true, env.SYNC_METADATA); // Get unsynced tasks
         
         const results = await Promise.all(
@@ -229,13 +234,15 @@ export default {
                 source: 'exact'
               };
               
-              // Store the mapping
-              await env.SYNC_METADATA.put(
-                `hash:${fingerprint.primaryHash}`,
-                JSON.stringify(taskMapping)
-              );
+              // Add to batch (not written yet)
+              await batchSync.addMapping(taskMapping);
               
-              // Skip legacy mapping to reduce writes - hash mapping is sufficient
+              // Also add label to Todoist task for quick filtering
+              try {
+                await todoist.updateTaskLabels(task.id, [...task.labels, 'synced-to-things']);
+              } catch (e) {
+                console.error('Failed to add label:', e);
+              }
               
               return { id: task.id, content: task.content, status: 'marked_synced' };
             } catch (error) {
@@ -243,6 +250,9 @@ export default {
             }
           })
         );
+        
+        // Single batch write for all mappings
+        await batchSync.flush();
         
         const responseData = { results, count: results.length };
         
@@ -326,6 +336,8 @@ export default {
       }
 
       if (path === '/things/sync' && request.method === 'POST') {
+        // Initialize batch sync manager
+        const batchSync = new BatchSyncManager(env);
         // Check for idempotency
         const requestId = request.headers.get('X-Request-Id');
         if (requestId) {
@@ -465,17 +477,8 @@ export default {
                     todoistModifiedAt: todoistTask.created_at
                   };
                   
-                  // Store by fingerprint hash (new method)
-                  await env.SYNC_METADATA.put(
-                    `hash:${fingerprint.primaryHash}`,
-                    JSON.stringify(updatedMapping)
-                  );
-                  
-                  // Store minimal mapping for backward compatibility (reduced from 3 to 1 write)
-                  await env.SYNC_METADATA.put(
-                    `mapping:things:${task.id}`,
-                    JSON.stringify({ todoistId: existingMapping.todoistId, thingsId: task.id })
-                  );
+                  // Add to batch sync manager (no write yet)
+                  await batchSync.addMapping(updatedMapping);
                   
                   return { 
                     id: task.id, 
@@ -526,17 +529,15 @@ export default {
                   todoistModifiedAt: newTask.created_at
                 };
                 
-                await env.SYNC_METADATA.put(
-                  `hash:${fingerprint.primaryHash}`,
-                  JSON.stringify(taskMapping)
-                );
+                // Add to batch sync manager (no write yet)
+                await batchSync.addMapping(taskMapping);
                 
-                // Store minimal mapping for Things ID lookup (backward compatibility)
-                // Only store one mapping instead of three to reduce KV writes
-                await env.SYNC_METADATA.put(
-                  `mapping:things:${task.id}`,
-                  JSON.stringify({ todoistId: newTask.id, thingsId: task.id })
-                );
+                // Also add label to mark as synced
+                try {
+                  await todoist.updateTaskLabels(newTask.id, [...taskLabels, 'synced-from-things']);
+                } catch (e) {
+                  console.error('Failed to add label:', e);
+                }
                 
                 return { 
                   id: task.id, 
@@ -581,6 +582,14 @@ export default {
               }
             })
           );
+          
+          // Batch write all mappings at once (single KV write)
+          try {
+            await batchSync.flush();
+          } catch (flushError) {
+            console.error('Failed to flush batch sync state:', flushError);
+            // Continue anyway - tasks were created in Todoist
+          }
           
           const created = results.filter(r => r.status === 'created').length;
           const existing = results.filter(r => r.status === 'already_exists').length;
@@ -2197,6 +2206,80 @@ export default {
           return new Response(JSON.stringify({
             error: 'Failed to process sync response',
             message: error instanceof Error ? error.message : 'Unknown error'
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      if (path === '/sync/migrate-to-batch' && request.method === 'POST') {
+        // Require repair auth token for migration
+        const authToken = request.headers.get('X-Repair-Auth');
+        if (!authToken || authToken !== env.REPAIR_AUTH_TOKEN) {
+          return new Response(JSON.stringify({ error: 'Unauthorized - valid X-Repair-Auth header required' }), {
+            status: 401,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+
+        const batchSync = new BatchSyncManager(env);
+        const dryRun = url.searchParams.get('dry_run') === 'true';
+        
+        try {
+          const startTime = Date.now();
+          
+          if (dryRun) {
+            // Count existing individual keys
+            const hashKeys = await env.SYNC_METADATA.list({ prefix: 'hash:' });
+            const mappingKeys = await env.SYNC_METADATA.list({ prefix: 'mapping:' });
+            
+            return new Response(JSON.stringify({
+              status: 'dry_run',
+              individualKeys: {
+                hash: hashKeys.keys.length,
+                mapping: mappingKeys.keys.length,
+                total: hashKeys.keys.length + mappingKeys.keys.length
+              },
+              action: 'Would migrate all individual keys to batch format',
+              estimatedKvWrites: 1, // Just one write for the batch
+              currentKvWritesPerSync: (hashKeys.keys.length + mappingKeys.keys.length) * 2, // Assuming updates
+              message: 'Run without dry_run=true to execute migration'
+            }), {
+              headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+            });
+          }
+          
+          // Execute migration
+          const migrated = await batchSync.migrateFromIndividualKeys();
+          
+          // Clean up legacy mapping keys
+          const mappingKeys = await env.SYNC_METADATA.list({ prefix: 'mapping:' });
+          let deletedMappings = 0;
+          
+          for (const key of mappingKeys.keys) {
+            try {
+              await env.SYNC_METADATA.delete(key.name);
+              deletedMappings++;
+            } catch (e) {
+              console.error(`Failed to delete ${key.name}:`, e);
+            }
+          }
+          
+          return new Response(JSON.stringify({
+            status: 'success',
+            migrated,
+            deletedMappings,
+            duration: Date.now() - startTime,
+            newBatchSize: await batchSync.getMappingCount(),
+            message: `Successfully migrated ${migrated} mappings to batch format`
+          }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({
+            error: 'Migration failed',
+            details: error instanceof Error ? error.message : 'Unknown error'
           }), {
             status: 500,
             headers: { ...corsHeaders, 'Content-Type': 'application/json' },
