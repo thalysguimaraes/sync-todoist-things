@@ -32,9 +32,9 @@ run_applescript() {
     
     while [ $retry_count -lt $max_retries ]; do
         if [ -n "$args" ]; then
-            result=$(timeout $timeout_seconds "$script_path" "$args" 2>&1)
+            result=$(gtimeout $timeout_seconds "$script_path" "$args" 2>&1)
         else
-            result=$(timeout $timeout_seconds "$script_path" 2>&1)
+            result=$(gtimeout $timeout_seconds "$script_path" 2>&1)
         fi
         
         if [ $? -eq 0 ]; then

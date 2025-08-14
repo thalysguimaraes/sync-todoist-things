@@ -235,20 +235,7 @@ export default {
                 JSON.stringify(taskMapping)
               );
               
-              // Also store legacy mapping for backward compatibility
-              const legacyMetadata: SyncMetadata = {
-                todoistId: task.id,
-                thingsId: taskMapping.thingsId,
-                lastSynced: new Date().toISOString(),
-                contentHash: await generateContentHash(task.content, task.description),
-                robustHash: fingerprint.primaryHash,
-                fingerprint
-              };
-              
-              await env.SYNC_METADATA.put(
-                `mapping:todoist:${task.id}`,
-                JSON.stringify(legacyMetadata)
-              );
+              // Skip legacy mapping to reduce writes - hash mapping is sufficient
               
               return { id: task.id, content: task.content, status: 'marked_synced' };
             } catch (error) {
@@ -484,23 +471,10 @@ export default {
                     JSON.stringify(updatedMapping)
                   );
                   
-                  // Keep legacy mappings for backward compatibility during transition
-                  const legacyMetadata: SyncMetadata = {
-                    todoistId: existingMapping.todoistId,
-                    thingsId: task.id,
-                    lastSynced: new Date().toISOString(),
-                    contentHash: await generateContentHash(task.title, task.notes),
-                    robustHash: fingerprint.primaryHash,
-                    fingerprint
-                  };
-                  
+                  // Store minimal mapping for backward compatibility (reduced from 3 to 1 write)
                   await env.SYNC_METADATA.put(
                     `mapping:things:${task.id}`,
-                    JSON.stringify(legacyMetadata)
-                  );
-                  await env.SYNC_METADATA.put(
-                    `mapping:todoist:${existingMapping.todoistId}`,
-                    JSON.stringify(legacyMetadata)
+                    JSON.stringify({ todoistId: existingMapping.todoistId, thingsId: task.id })
                   );
                   
                   return { 
@@ -557,23 +531,11 @@ export default {
                   JSON.stringify(taskMapping)
                 );
                 
-                // Keep legacy mappings for backward compatibility
-                const legacyMetadata: SyncMetadata = {
-                  todoistId: newTask.id,
-                  thingsId: task.id,
-                  lastSynced: new Date().toISOString(),
-                  contentHash: await generateContentHash(task.title, task.notes),
-                  robustHash: fingerprint.primaryHash,
-                  fingerprint
-                };
-                
+                // Store minimal mapping for Things ID lookup (backward compatibility)
+                // Only store one mapping instead of three to reduce KV writes
                 await env.SYNC_METADATA.put(
                   `mapping:things:${task.id}`,
-                  JSON.stringify(legacyMetadata)
-                );
-                await env.SYNC_METADATA.put(
-                  `mapping:todoist:${newTask.id}`,
-                  JSON.stringify(legacyMetadata)
+                  JSON.stringify({ todoistId: newTask.id, thingsId: task.id })
                 );
                 
                 return { 
@@ -583,11 +545,38 @@ export default {
                   todoist_id: newTask.id 
                 };
               } catch (error) {
+                // Log the actual error for debugging
+                console.error(`Error syncing task "${task.title}":`, error);
+                
+                // Provide detailed error information
+                let errorMessage = 'Unknown error';
+                let errorDetails = {};
+                
+                if (error instanceof Error) {
+                  errorMessage = error.message;
+                  
+                  // Check for common error patterns
+                  if (error.message.includes('limit exceeded')) {
+                    errorMessage = `Rate limit or quota error: ${error.message}`;
+                    errorDetails = { type: 'rate_limit', original: error.message };
+                  } else if (error.message.includes('namespace')) {
+                    errorMessage = `KV namespace configuration error: ${error.message}`;
+                    errorDetails = { type: 'kv_config', original: error.message };
+                  } else if (error.message.includes('put()')) {
+                    errorMessage = `KV storage write failed: ${error.message}`;
+                    errorDetails = { type: 'kv_write', original: error.message };
+                  } else if (error.message.includes('401')) {
+                    errorMessage = `Todoist authentication failed: ${error.message}`;
+                    errorDetails = { type: 'auth', original: error.message };
+                  }
+                }
+                
                 return { 
                   id: task.id, 
                   title: task.title,
                   status: 'error', 
-                  message: error instanceof Error ? error.message : 'Unknown error' 
+                  message: errorMessage,
+                  details: errorDetails
                 };
               }
             })
@@ -738,12 +727,9 @@ export default {
                         lastSynced: new Date().toISOString()
                       };
                       
+                      // Store minimal mapping (reduced writes)
                       await env.SYNC_METADATA.put(
                         `mapping:things:${task.thingsId}`,
-                        JSON.stringify(newMetadata)
-                      );
-                      await env.SYNC_METADATA.put(
-                        `mapping:todoist:${matchingTask.id}`,
                         JSON.stringify(newMetadata)
                       );
                       
@@ -783,12 +769,9 @@ export default {
                     lastSynced: new Date().toISOString()
                   };
                   
+                  // Store minimal mapping (reduced writes)
                   await env.SYNC_METADATA.put(
                     `mapping:things:${task.thingsId}`,
-                    JSON.stringify(updatedMetadata)
-                  );
-                  await env.SYNC_METADATA.put(
-                    `mapping:todoist:${todoistId}`,
                     JSON.stringify(updatedMetadata)
                   );
                   
@@ -1586,19 +1569,52 @@ export default {
                 };
 
                 if (!dryRun) {
-                  await env.SYNC_METADATA.put(
-                    `hash:${fingerprint.primaryHash}`,
-                    JSON.stringify(taskMapping)
-                  );
+                  // Retry logic for KV operations
+                  let retries = 3;
+                  let lastError;
+                  
+                  while (retries > 0) {
+                    try {
+                      await env.SYNC_METADATA.put(
+                        `hash:${fingerprint.primaryHash}`,
+                        JSON.stringify(taskMapping)
+                      );
+                      break; // Success, exit retry loop
+                    } catch (kvError) {
+                      lastError = kvError;
+                      retries--;
+                      if (retries > 0) {
+                        // Exponential backoff: 100ms, 200ms, 400ms
+                        await new Promise(resolve => setTimeout(resolve, 100 * Math.pow(2, 3 - retries)));
+                      }
+                    }
+                  }
+                  
+                  if (retries === 0 && lastError) {
+                    throw lastError; // Throw the actual error after all retries failed
+                  }
                 }
                 
                 results.mappingsCreated++;
                 results.actions.push(`Create mapping for: ${task.content.substring(0, 50)}...`);
               } catch (error) {
+                // Provide more detailed error information
+                let errorMessage = 'Unknown error';
+                if (error instanceof Error) {
+                  errorMessage = error.message;
+                  // Check for specific KV errors
+                  if (error.message.includes('limit')) {
+                    errorMessage = `KV operation failed: ${error.message}`;
+                  } else if (error.message.includes('namespace')) {
+                    errorMessage = `KV namespace error: ${error.message}`;
+                  }
+                }
+                
                 results.errors.push({
                   taskId: task.id,
                   content: task.content.substring(0, 50),
-                  error: error instanceof Error ? error.message : 'Unknown error'
+                  error: errorMessage,
+                  details: error instanceof Error ? error.stack : undefined
                 });
               }
             }
