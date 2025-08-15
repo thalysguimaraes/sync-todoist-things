@@ -1,12 +1,12 @@
 // Webhook handlers for different services
-import { 
-  WebhookEvent, 
-  GitHubWebhookEvent, 
-  NotionWebhookEvent, 
+import {
+  GitHubWebhookEvent,
+  NotionWebhookEvent,
   SlackWebhookEvent,
   GenericWebhookEvent,
   WebhookTransformation,
-  WebhookConfig
+  WebhookConfig,
+  AnyWebhookEvent
 } from './types';
 import { Env } from '../types';
 
@@ -19,17 +19,17 @@ export class WebhookHandlers {
   /**
    * Route webhook events to appropriate handlers
    */
-  async handleWebhook(event: WebhookEvent): Promise<WebhookTransformation> {
+  async handleWebhook(event: AnyWebhookEvent): Promise<WebhookTransformation> {
     try {
       switch (event.source) {
         case 'github':
-          return await this.handleGitHubWebhook(event as GitHubWebhookEvent);
+          return await this.handleGitHubWebhook(event);
         case 'notion':
-          return await this.handleNotionWebhook(event as NotionWebhookEvent);
+          return await this.handleNotionWebhook(event);
         case 'slack':
-          return await this.handleSlackWebhook(event as SlackWebhookEvent);
+          return await this.handleSlackWebhook(event);
         case 'generic':
-          return await this.handleGenericWebhook(event as GenericWebhookEvent);
+          return await this.handleGenericWebhook(event);
         default:
           return {
             success: false,

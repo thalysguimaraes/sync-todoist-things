@@ -1,11 +1,16 @@
 // Webhook event types and interfaces for real-time integrations
 
-export interface WebhookEvent {
+export interface WebhookEvent<T = unknown> {
   id: string;
   source: WebhookSource;
   type: string;
   timestamp: string;
-  data: any;
+  /**
+   * Service specific payload. The generic parameter allows
+   * consumers to get strong typing for the data structure they
+   * expect from the source service.
+   */
+  data: T;
   signature?: string;
   deliveryId?: string;
 }
@@ -13,7 +18,7 @@ export interface WebhookEvent {
 export type WebhookSource = 'github' | 'notion' | 'slack' | 'generic';
 
 // GitHub webhook events
-export interface GitHubWebhookEvent extends WebhookEvent {
+export interface GitHubWebhookEvent extends WebhookEvent<GitHubEventData> {
   source: 'github';
   type: 'issues' | 'pull_request' | 'issue_comment' | 'pull_request_review_comment';
   data: GitHubEventData;
@@ -83,7 +88,7 @@ export interface GitHubEventData {
 }
 
 // Notion webhook events
-export interface NotionWebhookEvent extends WebhookEvent {
+export interface NotionWebhookEvent extends WebhookEvent<NotionEventData> {
   source: 'notion';
   type: 'database' | 'page';
   data: NotionEventData;
@@ -110,7 +115,7 @@ export interface NotionEventData {
 }
 
 // Slack webhook events
-export interface SlackWebhookEvent extends WebhookEvent {
+export interface SlackWebhookEvent extends WebhookEvent<SlackEventData> {
   source: 'slack';
   type: 'star_added' | 'star_removed' | 'message' | 'reaction_added';
   data: SlackEventData;
@@ -133,11 +138,18 @@ export interface SlackEventData {
 }
 
 // Generic webhook events
-export interface GenericWebhookEvent extends WebhookEvent {
+export interface GenericWebhookEvent<T = Record<string, unknown>>
+  extends WebhookEvent<T> {
   source: 'generic';
   type: string;
-  data: any;
 }
+
+// Helper union of all supported webhook events
+export type AnyWebhookEvent =
+  | GitHubWebhookEvent
+  | NotionWebhookEvent
+  | SlackWebhookEvent
+  | GenericWebhookEvent;
 
 // Webhook transformation result
 export interface WebhookTransformation {
