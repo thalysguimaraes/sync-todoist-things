@@ -92,12 +92,15 @@ export class WebhookDispatcher {
       // Verify signature
       const signature = this.getSignatureFromHeaders(source, request);
       const secret = webhookConfig.sources[source].secret;
-      
+      const timestamp =
+        source === 'slack' ? request.headers.get('X-Slack-Request-Timestamp') : null;
+
       const isValidSignature = await this.security.verifySignature(
         source,
         payloadText,
         signature,
-        secret
+        secret,
+        timestamp
       );
 
       if (!isValidSignature) {
