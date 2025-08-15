@@ -12,7 +12,8 @@ export class WebhookSecurity {
     source: WebhookSource,
     payload: string,
     signature: string | null,
-    secret: string
+    secret: string,
+    timestamp?: string | null
   ): Promise<boolean> {
     if (!signature || !secret) {
       return false;
@@ -23,7 +24,7 @@ export class WebhookSecurity {
         case 'github':
           return await this.verifyGitHubSignature(payload, signature, secret);
         case 'slack':
-          return await this.verifySlackSignature(payload, signature, secret);
+          return await this.verifySlackSignature(payload, signature, secret, timestamp);
         case 'generic':
           return await this.verifyGenericSignature(payload, signature, secret);
         case 'notion':
@@ -63,17 +64,34 @@ export class WebhookSecurity {
   private async verifySlackSignature(
     payload: string,
     signature: string,
-    secret: string
+    secret: string,
+    timestamp: string | null | undefined
   ): Promise<boolean> {
     // Slack signature format: "v0=<signature>"
     if (!signature.startsWith('v0=')) {
       return false;
     }
 
-    const expectedSignature = signature.slice(3); // Remove "v0=" prefix
-    const computedSignature = await this.computeHMAC(payload, secret, 'SHA-256');
-    
-    return this.constantTimeCompare(expectedSignature, computedSignature);
+    if (!timestamp) {
+      return false;
+    }
+
+    const ts = Number(timestamp);
+    if (Number.isNaN(ts)) {
+      return false;
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    // Reject if timestamp is older than 5 minutes to prevent replay attacks
+    if (Math.abs(now - ts) > 60 * 5) {
+      return false;
+    }
+
+    const baseString = `v0:${timestamp}:${payload}`;
+    const computedSignature = await this.computeHMAC(baseString, secret, 'SHA-256');
+    const expectedSignature = `v0=${computedSignature}`;
+
+    return this.constantTimeCompare(signature, expectedSignature);
   }
 
   /**

@@ -119,6 +119,87 @@ describe('Webhook Integration Tests', () => {
       expect(isValid).toBe(false);
     });
 
+    it('should verify Slack signature correctly', async () => {
+      const payload = '{"type":"event_callback"}';
+      const secret = 'my-secret';
+      const timestamp = Math.floor(Date.now() / 1000).toString();
+
+      const baseString = `v0:${timestamp}:${payload}`;
+      const encoder = new TextEncoder();
+      const key = await crypto.subtle.importKey(
+        'raw',
+        encoder.encode(secret),
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['sign']
+      );
+      const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(baseString));
+      const expectedSig =
+        'v0=' +
+        Array.from(new Uint8Array(signature))
+          .map(b => b.toString(16).padStart(2, '0'))
+          .join('');
+
+      const isValid = await security.verifySignature(
+        'slack',
+        payload,
+        expectedSig,
+        secret,
+        timestamp
+      );
+
+      expect(isValid).toBe(true);
+    });
+
+    it('should reject invalid Slack signatures', async () => {
+      const payload = '{"type":"event_callback"}';
+      const secret = 'my-secret';
+      const timestamp = Math.floor(Date.now() / 1000).toString();
+      const invalidSignature = 'v0=invalid';
+
+      const isValid = await security.verifySignature(
+        'slack',
+        payload,
+        invalidSignature,
+        secret,
+        timestamp
+      );
+
+      expect(isValid).toBe(false);
+    });
+
+    it('should reject Slack signatures with old timestamp', async () => {
+      const payload = '{"type":"event_callback"}';
+      const secret = 'my-secret';
+      const oldTimestamp = (Math.floor(Date.now() / 1000) - 60 * 10).toString(); // 10 minutes ago
+
+      const baseString = `v0:${oldTimestamp}:${payload}`;
+      const encoder = new TextEncoder();
+      const key = await crypto.subtle.importKey(
+        'raw',
+        encoder.encode(secret),
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['sign']
+      );
+      const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(baseString));
+      const expectedSig =
+        'v0=' +
+        Array.from(new Uint8Array(signature))
+          .map(b => b.toString(16).padStart(2, '0'))
+          .join('');
+
+      const isValid = await security.verifySignature(
+        'slack',
+        payload,
+        expectedSig,
+        secret,
+        oldTimestamp
+      );
+
+      expect(isValid).toBe(false);
+    });
+
     it('should validate payload structures correctly', async () => {
       const validGitHubPayload = {
         action: 'opened',
