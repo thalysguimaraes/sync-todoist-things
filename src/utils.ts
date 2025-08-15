@@ -121,22 +121,43 @@ export function addTodoistIdToDescription(description: string, todoistId: string
   return `${cleanedDesc}\n\n[todoist-id:${todoistId}]`.trim();
 }
 
-export async function acquireSyncLock(kv: KVNamespace, timeout: number = 30000): Promise<boolean> {
+export async function acquireSyncLock(
+  kv: KVNamespace,
+  timeout: number = 30000
+): Promise<string | null> {
   const lockKey = 'sync:lock';
   const now = Date.now();
-  
+
   const existingLock = await kv.get(lockKey);
   if (existingLock) {
     const lockData = JSON.parse(existingLock);
     if (now - lockData.timestamp < timeout) {
-      return false;
+      return null;
     }
   }
-  
-  await kv.put(lockKey, JSON.stringify({ timestamp: now }), { expirationTtl: 60 });
-  return true;
+
+  const token = crypto.randomUUID();
+  await kv.put(
+    lockKey,
+    JSON.stringify({ timestamp: now, token }),
+    { expirationTtl: 60 }
+  );
+  return token;
 }
 
-export async function releaseSyncLock(kv: KVNamespace): Promise<void> {
-  await kv.delete('sync:lock');
+export async function releaseSyncLock(
+  kv: KVNamespace,
+  token: string
+): Promise<boolean> {
+  const lockKey = 'sync:lock';
+  const existingLock = await kv.get(lockKey);
+  if (!existingLock) return false;
+
+  const lockData = JSON.parse(existingLock);
+  if (lockData.token !== token) {
+    return false;
+  }
+
+  await kv.delete(lockKey);
+  return true;
 }

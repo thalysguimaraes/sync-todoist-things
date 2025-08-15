@@ -185,13 +185,13 @@ describe('Hash Generation', () => {
     describe('acquireSyncLock', () => {
       it('should acquire lock when not locked', async () => {
         mockKVNamespace.get.mockResolvedValue(null);
-        
+
         const result = await acquireSyncLock(mockKVNamespace);
-        
-        expect(result).toBe(true);
+
+        expect(typeof result).toBe('string');
         expect(mockKVNamespace.put).toHaveBeenCalledWith(
           'sync:lock',
-          expect.any(String),
+          expect.stringContaining(result!),
           expect.objectContaining({ expirationTtl: 60 })
         );
       });
@@ -199,40 +199,70 @@ describe('Hash Generation', () => {
       it('should not acquire lock when already locked', async () => {
         const recentLock = {
           timestamp: Date.now() - 5000, // 5 seconds ago
+          token: 'existing-token'
         };
         mockKVNamespace.get.mockResolvedValue(JSON.stringify(recentLock));
-        
+
         const result = await acquireSyncLock(mockKVNamespace);
-        
-        expect(result).toBe(false);
+
+        expect(result).toBeNull();
         expect(mockKVNamespace.put).not.toHaveBeenCalled();
       });
 
       it('should acquire lock when previous lock is expired', async () => {
         const expiredLock = {
           timestamp: Date.now() - 35000, // 35 seconds ago (default timeout is 30s)
+          token: 'old-token'
         };
         mockKVNamespace.get.mockResolvedValue(JSON.stringify(expiredLock));
-        
+
         const result = await acquireSyncLock(mockKVNamespace);
-        
-        expect(result).toBe(true);
+
+        expect(typeof result).toBe('string');
         expect(mockKVNamespace.put).toHaveBeenCalled();
+      });
+
+      it('should not allow lock stealing by another process', async () => {
+        const existingLock = {
+          timestamp: Date.now(),
+          token: 'owner-token'
+        };
+        mockKVNamespace.get.mockResolvedValue(JSON.stringify(existingLock));
+
+        const result = await acquireSyncLock(mockKVNamespace);
+
+        expect(result).toBeNull();
+        expect(mockKVNamespace.put).not.toHaveBeenCalled();
       });
     });
 
     describe('releaseSyncLock', () => {
-      it('should release lock', async () => {
-        await releaseSyncLock(mockKVNamespace);
-        
+      it('should release lock with correct token', async () => {
+        const lock = { timestamp: Date.now(), token: 'abc' };
+        mockKVNamespace.get.mockResolvedValue(JSON.stringify(lock));
+
+        const result = await releaseSyncLock(mockKVNamespace, 'abc');
+
+        expect(result).toBe(true);
         expect(mockKVNamespace.delete).toHaveBeenCalledWith('sync:lock');
       });
 
+      it('should not release lock with incorrect token', async () => {
+        const lock = { timestamp: Date.now(), token: 'abc' };
+        mockKVNamespace.get.mockResolvedValue(JSON.stringify(lock));
+
+        const result = await releaseSyncLock(mockKVNamespace, 'wrong');
+
+        expect(result).toBe(false);
+        expect(mockKVNamespace.delete).not.toHaveBeenCalled();
+      });
+
       it('should handle errors gracefully', async () => {
+        const lock = { timestamp: Date.now(), token: 'abc' };
+        mockKVNamespace.get.mockResolvedValue(JSON.stringify(lock));
         mockKVNamespace.delete.mockRejectedValue(new Error('KV error'));
-        
-        // The actual implementation doesn't catch errors, so it will throw
-        await expect(releaseSyncLock(mockKVNamespace)).rejects.toThrow('KV error');
+
+        await expect(releaseSyncLock(mockKVNamespace, 'abc')).rejects.toThrow('KV error');
       });
     });
   });
