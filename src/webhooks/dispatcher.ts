@@ -1,11 +1,11 @@
 // Webhook dispatcher - coordinates webhook processing
-import { 
-  WebhookEvent, 
-  WebhookSource, 
+import {
+  WebhookSource,
   WebhookTransformation,
   WebhookConfig,
   OutboundWebhookEvent,
-  OutboundWebhookPayload
+  OutboundWebhookPayload,
+  AnyWebhookEvent
 } from './types';
 import { WebhookHandlers } from './handlers';
 import { WebhookSecurity } from './security';
@@ -31,7 +31,7 @@ export class WebhookDispatcher {
     request: Request
   ): Promise<Response> {
     const startTime = Date.now();
-    let webhookEvent: WebhookEvent | null = null;
+    let webhookEvent: AnyWebhookEvent | null = null;
 
     try {
       // Get webhook configuration
@@ -110,10 +110,13 @@ export class WebhookDispatcher {
         source,
         type: this.extractEventType(source, payload, request),
         timestamp: new Date().toISOString(),
+        // The payload structure varies by source; it is sanitised but
+        // otherwise unchecked here and will be validated by specific
+        // handlers.
         data: this.security.sanitizePayload(payload),
         signature,
         deliveryId: request.headers.get('X-Delivery-ID') || undefined
-      };
+      } as AnyWebhookEvent;
 
       // Initialize handlers with config
       this.handlers = new WebhookHandlers(this.env, webhookConfig);

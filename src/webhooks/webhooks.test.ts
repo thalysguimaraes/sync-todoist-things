@@ -1,8 +1,17 @@
 // Tests for webhook functionality
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, expectTypeOf } from 'vitest';
 import { WebhookHandlers } from './handlers';
 import { WebhookSecurity } from './security';
-import { WebhookConfig, GitHubWebhookEvent, NotionWebhookEvent, SlackWebhookEvent } from './types';
+import {
+  WebhookConfig,
+  GitHubWebhookEvent,
+  NotionWebhookEvent,
+  SlackWebhookEvent,
+  GenericWebhookEvent,
+  GitHubEventData,
+  NotionEventData,
+  SlackEventData
+} from './types';
 import { createTestEnvironment } from '../test-helpers';
 
 describe('Webhook Integration Tests', () => {
@@ -180,9 +189,10 @@ describe('Webhook Integration Tests', () => {
           }
         }
       };
+      expectTypeOf(githubEvent.data).toMatchTypeOf<GitHubEventData>();
 
       const result = await handlers.handleWebhook(githubEvent);
-      
+
       expect(result.success).toBe(true);
       expect(result.thingsTask).toBeDefined();
       expect(result.thingsTask?.title).toBe('test-repo#1: Test Issue');
@@ -222,9 +232,10 @@ describe('Webhook Integration Tests', () => {
           }
         }
       };
+      expectTypeOf(notionEvent.data).toMatchTypeOf<NotionEventData>();
 
       const result = await handlers.handleWebhook(notionEvent);
-      
+
       expect(result.success).toBe(true);
       expect(result.thingsTask).toBeDefined();
       expect(result.thingsTask?.title).toBe('Notion: Test Task');
@@ -254,9 +265,10 @@ describe('Webhook Integration Tests', () => {
           event_ts: '1234567890.123456'
         }
       };
+      expectTypeOf(slackEvent.data).toMatchTypeOf<SlackEventData>();
 
       const result = await handlers.handleWebhook(slackEvent);
-      
+
       expect(result.success).toBe(true);
       expect(result.thingsTask).toBeDefined();
       expect(result.thingsTask?.title).toBe('Starred Slack message');
@@ -265,28 +277,38 @@ describe('Webhook Integration Tests', () => {
       expect(result.metadata?.source).toBe('slack');
     });
 
-    it('should handle generic webhook with transformation rules', async () => {
-      const genericEvent = {
-        id: 'test-generic-1',
-        source: 'generic' as const,
-        type: 'custom',
-        timestamp: new Date().toISOString(),
-        data: {
-          type: 'test',
-          title: 'Sample Task',
-          description: 'This is a sample task from external system'
-        }
-      };
+      it('should handle generic webhook with transformation rules', async () => {
+        const genericEvent: GenericWebhookEvent<{
+          type: string;
+          title: string;
+          description: string;
+        }> = {
+          id: 'test-generic-1',
+          source: 'generic',
+          type: 'custom',
+          timestamp: new Date().toISOString(),
+          data: {
+            type: 'test',
+            title: 'Sample Task',
+            description: 'This is a sample task from external system'
+          }
+        };
 
-      const result = await handlers.handleWebhook(genericEvent);
-      
-      expect(result.success).toBe(true);
-      expect(result.thingsTask).toBeDefined();
-      expect(result.thingsTask?.title).toBe('Test: Sample Task');
-      expect(result.thingsTask?.notes).toContain('Generated from webhook: This is a sample task from external system');
-      expect(result.thingsTask?.tags).toContain('webhook');
-      expect(result.thingsTask?.tags).toContain('test');
-    });
+        expectTypeOf(genericEvent.data).toMatchTypeOf<{
+          type: string;
+          title: string;
+          description: string;
+        }>();
+
+        const result = await handlers.handleWebhook(genericEvent);
+
+        expect(result.success).toBe(true);
+        expect(result.thingsTask).toBeDefined();
+        expect(result.thingsTask?.title).toBe('Test: Sample Task');
+        expect(result.thingsTask?.notes).toContain('Generated from webhook: This is a sample task from external system');
+        expect(result.thingsTask?.tags).toContain('webhook');
+        expect(result.thingsTask?.tags).toContain('test');
+      });
 
     it('should filter by repository configuration', async () => {
       const githubEvent: GitHubWebhookEvent = {
