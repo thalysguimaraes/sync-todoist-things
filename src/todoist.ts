@@ -51,7 +51,12 @@ export class TodoistClient {
         throw new Error(`Todoist API error: ${response.status} ${response.statusText}`);
       }
 
-      return response.json();
+      if (response.status === 204) {
+        // No content to parse for successful requests
+        return undefined as unknown as T;
+      }
+
+      return (await response.json()) as T;
     } catch (error) {
       // Network errors - retry with backoff
       if (retryCount < maxRetries) {
