@@ -360,9 +360,9 @@ export default {
         }
         
         // Acquire sync lock to prevent concurrent syncs
-        const lockAcquired = await acquireSyncLock(env.SYNC_METADATA);
-        if (!lockAcquired) {
-          return new Response(JSON.stringify({ 
+        const lockToken = await acquireSyncLock(env.SYNC_METADATA);
+        if (!lockToken) {
+          return new Response(JSON.stringify({
             error: 'Sync already in progress',
             retry_after: 30
           }), {
@@ -703,7 +703,9 @@ export default {
 
           throw error;
         } finally {
-          await releaseSyncLock(env.SYNC_METADATA);
+          if (lockToken) {
+            await releaseSyncLock(env.SYNC_METADATA, lockToken);
+          }
         }
       }
 
@@ -2336,7 +2338,11 @@ export default {
       }
       
       // Acquire sync lock
-      await acquireSyncLock(env.SYNC_METADATA);
+      const cronLockToken = await acquireSyncLock(env.SYNC_METADATA);
+      if (!cronLockToken) {
+        console.log('Another sync is already in progress, skipping cron trigger');
+        return;
+      }
       
       // STEP 1: Todoist → Things coordination
       // Check if there are new tasks in Todoist that need syncing
@@ -2412,7 +2418,9 @@ export default {
       }
       
       // Release sync lock
-      await releaseSyncLock(env.SYNC_METADATA);
+      if (cronLockToken) {
+        await releaseSyncLock(env.SYNC_METADATA, cronLockToken);
+      }
       
       await metrics.recordMetric({
         timestamp: new Date().toISOString(),
@@ -2433,7 +2441,9 @@ export default {
       
       // Ensure sync lock is released on error
       try {
-        await releaseSyncLock(env.SYNC_METADATA);
+        if (cronLockToken) {
+          await releaseSyncLock(env.SYNC_METADATA, cronLockToken);
+        }
       } catch (lockError) {
         console.error('Failed to release sync lock:', lockError);
       }
