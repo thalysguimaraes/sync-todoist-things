@@ -1,6 +1,8 @@
 import { TodoistTask, ThingsTask } from './types';
 
 export function convertToThingsFormat(todoistTasks: TodoistTask[]): ThingsTask[] {
+  const localToday = new Date().toLocaleDateString('en-CA');
+
   return todoistTasks.map(task => {
     const thingsTask: ThingsTask = {
       type: 'to-do',
@@ -14,7 +16,7 @@ export function convertToThingsFormat(todoistTasks: TodoistTask[]): ThingsTask[]
     }
 
     if (task.due) {
-      if (task.due.date === new Date().toISOString().split('T')[0]) {
+      if (task.due.date === localToday) {
         thingsTask.attributes.when = 'today';
       } else if (task.due.datetime) {
         thingsTask.attributes.deadline = task.due.datetime;
