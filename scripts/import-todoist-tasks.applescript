@@ -16,12 +16,12 @@ on run argv
         -- Parse the JSON tasks
         set todoist_tasks to my parseTodoistTasks(jsonString)
         
-        -- Get existing inbox task titles
+        -- Get existing inbox task titles (normalized)
         set existing_titles to {}
         set inbox_todos to to dos of list "Inbox"
         repeat with todo_item in inbox_todos
             if status of todo_item is open then
-                set end of existing_titles to name of todo_item
+                set end of existing_titles to my normalize_title(name of todo_item)
             end if
         end repeat
         
@@ -31,9 +31,10 @@ on run argv
             set task_notes to notes of task_data
             set task_due to due of task_data
             set todoist_id to todoistId of task_data
+            set normalized_title to my normalize_title(task_title)
             
             -- Check if task already exists
-            if task_title is not in existing_titles then
+            if normalized_title is not in existing_titles then
                 -- Create new task
                 set new_todo to make new to do with properties {name:task_title}
                 move new_todo to list "Inbox"
@@ -59,7 +60,7 @@ on run argv
                 set tag names of new_todo to {"synced-from-todoist"}
                 
                 set imported_count to imported_count + 1
-                set end of existing_titles to task_title -- Add to existing to prevent duplicates in same run
+                set end of existing_titles to normalized_title -- Add to existing to prevent duplicates in same run
             else
                 set skipped_count to skipped_count + 1
             end if
@@ -68,6 +69,18 @@ on run argv
     
     return "Imported " & imported_count & " tasks, skipped " & skipped_count & " existing"
 end run
+
+-- Normalize a title: lowercase, trim, collapse whitespace
+on normalize_title(input_title)
+    if input_title is missing value then return ""
+    set theTitle to input_title as string
+    try
+        set normalized to do shell script "printf %s " & quoted form of theTitle & " | tr '[:upper:]' '[:lower:]' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'"
+        return normalized
+    on error
+        return theTitle
+    end try
+end normalize_title
 
 -- Parse JSON array of Todoist tasks
 on parseTodoistTasks(jsonStr)

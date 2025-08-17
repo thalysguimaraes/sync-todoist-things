@@ -1318,10 +1318,10 @@ export default {
       }
 
       if (path === '/debug/mappings' && request.method === 'GET') {
-        // Debug endpoint to analyze fingerprint mappings and detect issues
+        // Debug endpoint to analyze fingerprint mappings and detect issues (batch-aware)
         try {
           const results = {
-            hashMappings: [],
+            mappings: [],
             legacyMappings: [],
             todoistTasks: [],
             analysis: {
@@ -1329,22 +1329,14 @@ export default {
               orphanedMappings: [],
               tasksWithoutMappings: []
             }
-          };
+          } as any;
 
-          // Get all hash-based mappings
-          const hashList = await env.SYNC_METADATA.list({ prefix: 'hash:' });
-          for (const key of hashList.keys) {
-            const mapping = await env.SYNC_METADATA.get(key.name);
-            if (mapping) {
-              const taskMapping = JSON.parse(mapping) as TaskMapping;
-              results.hashMappings.push({
-                hash: key.name.replace('hash:', ''),
-                ...taskMapping
-              });
-            }
-          }
+          // Load batch state once
+          const batchSync = new BatchSyncManager(env);
+          const state = await batchSync.loadState();
+          results.mappings = Object.values(state.mappings);
 
-          // Get all legacy mappings
+          // Get all legacy mappings (for visibility)
           const legacyList = await env.SYNC_METADATA.list({ prefix: 'mapping:' });
           for (const key of legacyList.keys) {
             const mapping = await env.SYNC_METADATA.get(key.name);
@@ -1367,26 +1359,25 @@ export default {
               description: task.description || '',
               labels: task.labels,
               fingerprint: fingerprint.primaryHash,
-              hasMapping: results.hashMappings.some(m => m.todoistId === task.id)
+              hasMapping: !!state.mappings[fingerprint.primaryHash]
             });
           }
 
           // Analysis: Find tasks without mappings
-          results.analysis.tasksWithoutMappings = results.todoistTasks.filter(t => !t.hasMapping);
+          results.analysis.tasksWithoutMappings = results.todoistTasks.filter((t: any) => !t.hasMapping);
 
           // Analysis: Find orphaned mappings (mappings without corresponding tasks)
-          results.analysis.orphanedMappings = results.hashMappings.filter(m => 
-            !results.todoistTasks.some(t => t.id === m.todoistId)
+          results.analysis.orphanedMappings = Object.values(state.mappings).filter((m: any) => 
+            !results.todoistTasks.some((t: any) => t.id === m.todoistId)
           );
 
           // Analysis: Find duplicate fingerprints
-          const fingerprintCounts = {};
-          results.hashMappings.forEach(m => {
+          const fingerprintCounts: Record<string, number> = {};
+          Object.values(state.mappings).forEach((m: any) => {
             fingerprintCounts[m.fingerprint.primaryHash] = (fingerprintCounts[m.fingerprint.primaryHash] || 0) + 1;
           });
-          
           results.analysis.duplicateFingerprints = Object.entries(fingerprintCounts)
-            .filter(([hash, count]) => count > 1)
+            .filter(([_, count]) => (count as number) > 1)
             .map(([hash, count]) => ({ hash, count }));
 
           return new Response(JSON.stringify(results, null, 2), {
@@ -1412,16 +1403,13 @@ export default {
           // Get all Todoist tasks
           const todoistTasks = await todoist.getInboxTasks(false, env.SYNC_METADATA);
           
-          // Get all hash mappings
-          const hashList = await env.SYNC_METADATA.list({ prefix: 'hash:' });
+          // Load batch mappings (new architecture)
+          const batchSync = new BatchSyncManager(env);
+          const state = await batchSync.loadState();
           const hashMappings = new Map<string, TaskMapping>();
-          
-          for (const key of hashList.keys) {
-            const mapping = await env.SYNC_METADATA.get(key.name);
-            if (mapping) {
-              hashMappings.set(key.name, JSON.parse(mapping) as TaskMapping);
-            }
-          }
+          Object.values(state.mappings).forEach((m) => {
+            hashMappings.set(`hash:${m.fingerprint.primaryHash}`, m);
+          });
           
           // Check for orphaned mappings (mappings without corresponding Todoist tasks)
           for (const [hashKey, mapping] of hashMappings) {

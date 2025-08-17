@@ -12,7 +12,7 @@ on run
         
         -- Process each to-do
         repeat with aTodo in inboxTodos
-            set todoTitle to name of aTodo
+            set todoTitle to my normalize_title(name of aTodo)
             set todoId to id of aTodo
             
             -- Check if we've seen this title before
@@ -37,4 +37,18 @@ on run
         
         return "Deleted " & deletedCount & " duplicate tasks"
     end tell
+    
+    return "Deleted " & deletedCount & " duplicate tasks"
 end run
+
+-- Normalize a title: lowercase, trim, collapse whitespace
+on normalize_title(input_title)
+    if input_title is missing value then return ""
+    set theTitle to input_title as string
+    try
+        set normalized to do shell script "printf %s " & quoted form of theTitle & " | tr '[:upper:]' '[:lower:]' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'"
+        return normalized
+    on error
+        return theTitle
+    end try
+end normalize_title

@@ -13,7 +13,7 @@ on run
         -- Build a map of task names to find duplicates
         repeat with todo_item in inbox_todos
             if status of todo_item is open then
-                set task_name to name of todo_item
+                set task_name to my normalize_title(name of todo_item)
                 set task_id to id of todo_item
                 set task_tags to tag names of todo_item
                 
@@ -63,3 +63,15 @@ on run
     
     return json_output
 end run
+
+-- Normalize a title: lowercase, trim, collapse whitespace
+on normalize_title(input_title)
+    if input_title is missing value then return ""
+    set theTitle to input_title as string
+    try
+        set normalized to do shell script "printf %s " & quoted form of theTitle & " | tr '[:upper:]' '[:lower:]' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'"
+        return normalized
+    on error
+        return theTitle
+    end try
+end normalize_title
