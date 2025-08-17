@@ -10,6 +10,7 @@ A powerful Cloudflare Worker that enables automatic bidirectional synchronizatio
 - **🤝 Conflict Resolution**: Smart detection and resolution when tasks are modified in both apps
 - **🎯 Selective Sync**: Filter by projects and tags - sync only what you need
 - **🚫 Duplicate Prevention**: Advanced fingerprint-based deduplication
+  - Now also normalizes Things titles (case/whitespace) to prevent near-duplicates during import
 - **📊 Performance Metrics**: Track sync performance and monitor health
 - **⚡ Idempotency**: Safe request retry with automatic deduplication
 - **🔧 Configuration API**: Customize sync behavior via REST API
@@ -18,6 +19,19 @@ A powerful Cloudflare Worker that enables automatic bidirectional synchronizatio
 - **⏰ CF Workers Cron**: Server-side sync coordination running every 2 minutes
 - **🚀 Easy Setup**: Automated setup wizard for quick deployment
 - **📝 Comprehensive Testing**: 55+ unit tests and integration tests
+
+## ✨ What's New (2025-08-17)
+
+- Batch-aware completion flow with reduced KV writes (prevents quota spikes)
+- Deletion propagation: Things ➝ Todoist via `POST /things/sync-deleted`
+- Cross-ID finalization: `POST /things/created-mappings` to persist real Things IDs back to Todoist and batch state
+- Repair utilities (no data recreation):
+  - `POST /repair/backfill-mappings` (use existing `[things-id:...]` in Todoist descriptions)
+  - `POST /repair/backfill-by-fingerprint` (match Things ➝ Todoist by fingerprint)
+  - `POST /repair/close-todoist` (authoritatively close specific Todoist tasks)
+  - `POST /repair/delete-mappings` (delete specific batch mapping hashes)
+- Normalized duplicate prevention in AppleScripts (title case/whitespace)
+- Webhook intake stub for Todoist events (`/webhook/todoist`) to enable real-time completion/deletion propagation
 
 ## 🏗 Architecture
 
@@ -335,6 +349,7 @@ curl -X POST https://your-worker.workers.dev/conflicts/resolve \
 - `POST /webhook/notion` - Notion webhook endpoint
 - `POST /webhook/slack` - Slack webhook endpoint
 - `POST /webhook/generic` - Generic webhook endpoint
+- `POST /webhook/todoist` - Todoist webhook endpoint (completion/deletion intake)
 - `GET /webhook/config` - Get webhook configuration
 - `PUT /webhook/config` - Update webhook configuration
 - `POST /webhook/test` - Test webhook processing
@@ -350,6 +365,10 @@ curl -X POST https://your-worker.workers.dev/conflicts/resolve \
 ### Maintenance
 - `POST /sync/bulk` - Bulk sync operations (auth required)
 - `POST /metrics/cleanup` - Clean old metrics (auth required)
+- `POST /repair/backfill-mappings` - Create batch mappings from Todoist descriptions with `[things-id:...]` (auth required)
+- `POST /repair/backfill-by-fingerprint` - Create batch mappings by fingerprint using Things payload (auth required)
+- `POST /repair/close-todoist` - Close specific Todoist tasks (auth required)
+- `POST /repair/delete-mappings` - Delete specific batch mapping hashes (auth required)
 
 ## 🧪 Testing
 
