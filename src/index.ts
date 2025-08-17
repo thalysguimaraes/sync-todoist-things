@@ -858,6 +858,44 @@ export default {
         }
       }
 
+      if (path === '/things/sync-deleted' && request.method === 'POST') {
+        try {
+          const deleted = await request.json() as Array<{ thingsId: string; deletedAt?: string }>;
+          if (!Array.isArray(deleted)) {
+            return new Response(JSON.stringify({ error: 'Invalid body: expected array' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+          }
+
+          const batchSync = new BatchSyncManager(env);
+          await batchSync.loadState();
+
+          const results = await Promise.all(deleted.map(async (d) => {
+            try {
+              const mapping = await batchSync.getMappingByThingsId(d.thingsId);
+              if (!mapping) {
+                return { thingsId: d.thingsId, status: 'not_found' };
+              }
+              // Prefer to close Todoist task (non-destructive). If already completed, this is idempotent.
+              const ok = await todoist.closeTask(mapping.todoistId);
+              if (ok) {
+                await batchSync.addMapping({ ...mapping, lastSynced: new Date().toISOString() });
+                return { thingsId: d.thingsId, todoistId: mapping.todoistId, status: 'closed' };
+              }
+              return { thingsId: d.thingsId, todoistId: mapping.todoistId, status: 'error' };
+            } catch (e) {
+              return { thingsId: d.thingsId, status: 'error' };
+            }
+          }));
+
+          await batchSync.flush();
+          const closed = results.filter(r => r.status === 'closed').length;
+          const notFound = results.filter(r => r.status === 'not_found').length;
+          const errors = results.filter(r => r.status === 'error').length;
+          return new Response(JSON.stringify({ results, summary: { closed, notFound, errors, total: results.length } }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        } catch (error) {
+          return new Response(JSON.stringify({ error: 'Failed to sync deletions', message: error instanceof Error ? error.message : 'Unknown error' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
+      }
+
       if (path === '/sync/status' && request.method === 'GET') {
         const lockKey = 'sync:lock';
         const lockData = await env.SYNC_METADATA.get(lockKey);

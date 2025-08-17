@@ -19,8 +19,9 @@ Status legend: [ ] TODO, [~] In progress, [x] Done
 - [ ] AppleScripts: `mark-things-done.applescript`, `delete-things-tasks.applescript`
 
 ## 4) Things→Todoist deletion
-- [ ] AppleScript to read recently deleted/trashed in Things
-- [ ] Endpoint `POST /things/sync-deleted` to close/delete matching Todoist tasks via mapping
+- [x] AppleScript to read recently deleted/trashed in Things (`scripts/read-things-deleted.applescript`)
+- [x] Endpoint `POST /things/sync-deleted` to close matching Todoist tasks via mapping
+- [x] Wire into sync script (Step 4)
 
 ## 5) Mapping hygiene and repair
 - [ ] Daily cron to auto-clean orphaned mappings and set mapping status (active/completed/deleted)

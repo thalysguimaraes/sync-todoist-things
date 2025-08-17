@@ -211,6 +211,31 @@ else
     fi
 fi
 
+# STEP 4: Sync deletions from Things to Todoist (close corresponding Todoist tasks)
+log "Step 4: Syncing deletions from Things → Todoist"
+
+deleted_tasks=$("${SCRIPT_DIR}/read-things-deleted.applescript" 2>/dev/null)
+
+if [ $? -ne 0 ] || [ -z "$deleted_tasks" ] || [ "$deleted_tasks" = "[]" ]; then
+    log "No deleted tasks in Things to sync"
+else
+    deleted_count=$(echo "$deleted_tasks" | grep -o '"thingsId"' | wc -l | tr -d ' ')
+    log "Found $deleted_count deleted tasks in Things"
+    
+    deletion_response=$(curl -s -X POST "${WORKER_URL}/things/sync-deleted" \
+        -H "Content-Type: application/json" \
+        -d "$deleted_tasks")
+    
+    if [ $? -eq 0 ]; then
+        closed=$(echo "$deletion_response" | grep -o '"closed":[0-9]*' | head -1 | cut -d':' -f2)
+        errors=$(echo "$deletion_response" | grep -o '"errors":[0-9]*' | head -1 | cut -d':' -f2)
+        log "Deletions sync: ${closed:-0} closed in Todoist, ${errors:-0} errors"
+    else
+        log "ERROR: Failed to sync deletions from Things to Todoist"
+        notify "Todoist-Things Sync" "Failed to sync deletions"
+    fi
+fi
+
 log "Bidirectional sync completed"
 
 # Success notification
