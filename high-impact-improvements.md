@@ -14,7 +14,7 @@ Status legend: [ ] TODO, [~] In progress, [x] Done
 - [ ] Add a Things completions AppleScript that returns only completed-within-window items robustly (exists: `scripts/read-things-completed.applescript`)
 
 ## 3) Todoist→Things completion and deletion
-- [ ] Add Todoist webhook endpoint (e.g. `/webhook/todoist`) and dispatcher to capture `item:completed`, `item:deleted`
+- [x] Add Todoist webhook endpoint (e.g. `/webhook/todoist`) and dispatcher stub to capture `item:completed`, `item:deleted`
 - [ ] Store events to KV and have mac agent apply via AppleScript (mark done/delete by `thingsId`)
 - [ ] AppleScripts: `mark-things-done.applescript`, `delete-things-tasks.applescript`
 

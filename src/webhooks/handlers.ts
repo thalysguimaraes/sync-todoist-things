@@ -6,7 +6,8 @@ import {
   GenericWebhookEvent,
   WebhookTransformation,
   WebhookConfig,
-  AnyWebhookEvent
+  AnyWebhookEvent,
+  WebhookEvent
 } from './types';
 import { Env } from '../types';
 
@@ -29,7 +30,9 @@ export class WebhookHandlers {
         case 'slack':
           return await this.handleSlackWebhook(event);
         case 'generic':
-          return await this.handleGenericWebhook(event);
+          return await this.handleGenericWebhook(event as GenericWebhookEvent);
+        case 'todoist':
+          return await this.handleTodoistWebhook(event as WebhookEvent);
         default:
           return {
             success: false,
@@ -301,6 +304,35 @@ export class WebhookHandlers {
     }
 
     return { success: false, error: 'No matching transformation rule found' };
+  }
+
+  /**
+   * Handle Todoist webhook events (completed/deleted)
+   * This does not create Things tasks directly. Instead we enqueue sync requests
+   * for the mac agent to apply changes in Things by thingsId.
+   */
+  private async handleTodoistWebhook(event: WebhookEvent): Promise<WebhookTransformation> {
+    // Expect event.data with an array of changes or a single change
+    const changes = Array.isArray(event.data) ? event.data : [event.data];
+    try {
+      for (const change of changes) {
+        const kind = change.event_name || change.type || '';
+        const todoistId = change.id || change.item_id || change.task_id;
+        if (!todoistId) continue;
+        // Enqueue request for local agent with minimal payload
+        const request = {
+          id: `todoist-webhook-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+          timestamp: new Date().toISOString(),
+          type: kind.includes('deleted') ? 'todoist_deleted' : kind.includes('completed') ? 'todoist_completed' : 'todoist_event',
+          todoistId,
+          status: 'pending'
+        };
+        await this.env.SYNC_METADATA.put(`sync-request:${request.id}`, JSON.stringify(request), { expirationTtl: 3600 });
+      }
+      return { success: true };
+    } catch (e) {
+      return { success: false, error: e instanceof Error ? e.message : 'Todoist webhook handling failed' };
+    }
   }
 
   // Helper methods for building task notes

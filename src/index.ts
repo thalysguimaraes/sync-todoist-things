@@ -124,7 +124,7 @@ export default {
       const metrics = new MetricsTracker(env);
 
       // Webhook processing endpoints (for actual webhook events)
-      if (path.startsWith('/webhook/') && ['github', 'notion', 'slack', 'generic'].includes(path.split('/')[2])) {
+      if (path.startsWith('/webhook/') && ['github', 'notion', 'slack', 'generic', 'todoist'].includes(path.split('/')[2])) {
         const webhookDispatcher = new WebhookDispatcher(env);
         const source = path.split('/')[2] as WebhookSource;
         return await webhookDispatcher.processWebhook(source, request);
@@ -893,6 +893,202 @@ export default {
           return new Response(JSON.stringify({ results, summary: { closed, notFound, errors, total: results.length } }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
         } catch (error) {
           return new Response(JSON.stringify({ error: 'Failed to sync deletions', message: error instanceof Error ? error.message : 'Unknown error' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
+      }
+
+      // Repair utility: backfill batch mappings from Todoist descriptions containing [things-id:...] (no task creation)
+      if (path === '/repair/backfill-mappings' && request.method === 'POST') {
+        // Require repair auth token
+        const authToken = request.headers.get('X-Repair-Auth');
+        if (!authToken || authToken !== env.REPAIR_AUTH_TOKEN) {
+          return new Response(JSON.stringify({ error: 'Unauthorized - valid X-Repair-Auth header required' }), {
+            status: 401,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+
+        const dryRun = url.searchParams.get('dry_run') === 'true';
+        try {
+          const batchSync = new BatchSyncManager(env);
+          await batchSync.loadState();
+
+          const tasks = await todoist.getInboxTasks(false, env.SYNC_METADATA);
+          const results: Array<{ todoistId: string; thingsId?: string; action: string } > = [];
+          let created = 0, updated = 0, skipped = 0, missing = 0;
+
+          for (const task of tasks) {
+            const thingsId = extractThingsIdFromNotes(task.description || '');
+            if (!thingsId) {
+              missing++;
+              continue;
+            }
+            const fingerprint = await createTaskFingerprint(task.content, task.description);
+            const existing = await batchSync.getMapping(fingerprint.primaryHash);
+            if (existing) {
+              if (existing.thingsId !== thingsId) {
+                if (!dryRun) {
+                  await batchSync.addMapping({ ...existing, thingsId, lastSynced: new Date().toISOString() });
+                }
+                updated++;
+                results.push({ todoistId: task.id, thingsId, action: 'updated' });
+              } else {
+                skipped++;
+                results.push({ todoistId: task.id, thingsId, action: 'skipped' });
+              }
+            } else {
+              const mapping: TaskMapping = {
+                todoistId: task.id,
+                thingsId,
+                fingerprint,
+                lastSynced: new Date().toISOString(),
+                source: 'backfill',
+                version: 2
+              };
+              if (!dryRun) {
+                await batchSync.addMapping(mapping);
+              }
+              created++;
+              results.push({ todoistId: task.id, thingsId, action: 'created' });
+            }
+          }
+
+          if (!dryRun) {
+            await batchSync.flush();
+          }
+
+          return new Response(JSON.stringify({
+            dryRun,
+            summary: { created, updated, skipped, missing, total: tasks.length },
+            results
+          }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        } catch (error) {
+          return new Response(JSON.stringify({ error: 'Backfill failed', message: error instanceof Error ? error.message : 'Unknown error' }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      // Repair utility: backfill batch mappings by fingerprint matching Things → Todoist
+      if (path === '/repair/backfill-by-fingerprint' && request.method === 'POST') {
+        // Require repair auth token
+        const authToken = request.headers.get('X-Repair-Auth');
+        if (!authToken || authToken !== env.REPAIR_AUTH_TOKEN) {
+          return new Response(JSON.stringify({ error: 'Unauthorized - valid X-Repair-Auth header required' }), {
+            status: 401,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+
+        try {
+          const thingsTasks = await request.json() as ThingsInboxTask[];
+          if (!Array.isArray(thingsTasks)) {
+            return new Response(JSON.stringify({ error: 'Invalid body: expected array of Things tasks' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+          }
+
+          const batchSync = new BatchSyncManager(env);
+          await batchSync.loadState();
+
+          let created = 0, updated = 0, notFound = 0, skipped = 0;
+          const results: any[] = [];
+
+          for (const t of thingsTasks) {
+            try {
+              // Try to find existing Todoist task via fingerprint
+              const match = await todoist.findExistingTaskByFingerprint(t.title, t.notes, t.due, t.id, env.SYNC_METADATA);
+              if (!match) {
+                notFound++;
+                results.push({ thingsId: t.id, action: 'not_found' });
+                continue;
+              }
+
+              const existing = await batchSync.getMapping(match.fingerprint.primaryHash);
+              if (existing) {
+                if (existing.thingsId !== t.id || existing.todoistId !== match.todoistId) {
+                  await batchSync.addMapping({ ...existing, thingsId: t.id, todoistId: match.todoistId, lastSynced: new Date().toISOString() });
+                  updated++;
+                  results.push({ thingsId: t.id, todoistId: match.todoistId, action: 'updated' });
+                } else {
+                  skipped++;
+                  results.push({ thingsId: t.id, todoistId: match.todoistId, action: 'skipped' });
+                }
+              } else {
+                await batchSync.addMapping({
+                  todoistId: match.todoistId,
+                  thingsId: t.id,
+                  fingerprint: match.fingerprint,
+                  lastSynced: new Date().toISOString(),
+                  source: match.source || 'hash',
+                  version: 2
+                });
+                created++;
+                results.push({ thingsId: t.id, todoistId: match.todoistId, action: 'created' });
+              }
+            } catch (e) {
+              results.push({ thingsId: t.id, action: 'error', message: e instanceof Error ? e.message : 'Unknown error' });
+            }
+          }
+
+          await batchSync.flush();
+          return new Response(JSON.stringify({ summary: { created, updated, skipped, notFound, total: thingsTasks.length }, results }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        } catch (error) {
+          return new Response(JSON.stringify({ error: 'Backfill (fingerprint) failed', message: error instanceof Error ? error.message : 'Unknown error' }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      if (path === '/repair/close-todoist' && request.method === 'POST') {
+        // Close specific Todoist tasks (authoritative clean-up). Requires repair auth.
+        const authToken = request.headers.get('X-Repair-Auth');
+        if (!authToken || authToken !== env.REPAIR_AUTH_TOKEN) {
+          return new Response(JSON.stringify({ error: 'Unauthorized - valid X-Repair-Auth header required' }), {
+            status: 401,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+        try {
+          const body = await request.json() as { ids: string[] };
+          if (!body || !Array.isArray(body.ids)) {
+            return new Response(JSON.stringify({ error: 'Invalid body: expected { ids: string[] }' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+          }
+          const results = await Promise.all(body.ids.map(async (id) => ({ id, closed: await todoist.closeTask(id) })));
+          const closed = results.filter(r => r.closed).length;
+          return new Response(JSON.stringify({ closed, total: results.length, results }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        } catch (error) {
+          return new Response(JSON.stringify({ error: 'Failed to close tasks', message: error instanceof Error ? error.message : 'Unknown error' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
+      }
+
+      if (path === '/repair/delete-mappings' && request.method === 'POST') {
+        // Delete batch mappings by fingerprint hash (array of strings)
+        const authToken = request.headers.get('X-Repair-Auth');
+        if (!authToken || authToken !== env.REPAIR_AUTH_TOKEN) {
+          return new Response(JSON.stringify({ error: 'Unauthorized - valid X-Repair-Auth header required' }), {
+            status: 401,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+        try {
+          const body = await request.json() as { hashes: string[] } | string[];
+          const hashes = Array.isArray(body) ? body as string[] : (body as any)?.hashes;
+          if (!Array.isArray(hashes)) {
+            return new Response(JSON.stringify({ error: 'Invalid body: expected { hashes: string[] } or [hashes]' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+          }
+          const batchSync = new BatchSyncManager(env);
+          await batchSync.loadState();
+          let deleted = 0;
+          for (const h of hashes) {
+            try {
+              await batchSync.removeMapping(h);
+              deleted++;
+            } catch {}
+          }
+          await batchSync.flush();
+          return new Response(JSON.stringify({ deleted, total: hashes.length }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        } catch (error) {
+          return new Response(JSON.stringify({ error: 'Failed to delete mappings', message: error instanceof Error ? error.message : 'Unknown error' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
         }
       }
 

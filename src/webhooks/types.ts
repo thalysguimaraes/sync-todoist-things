@@ -15,7 +15,7 @@ export interface WebhookEvent<T = unknown> {
   deliveryId?: string;
 }
 
-export type WebhookSource = 'github' | 'notion' | 'slack' | 'generic';
+export type WebhookSource = 'github' | 'notion' | 'slack' | 'generic' | 'todoist';
 
 // GitHub webhook events
 export interface GitHubWebhookEvent extends WebhookEvent<GitHubEventData> {
