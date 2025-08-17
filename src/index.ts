@@ -281,6 +281,55 @@ export default {
         });
       }
 
+      if (path === '/things/created-mappings' && request.method === 'POST') {
+        // Accept created mapping pairs from local importer to finalize IDs on both sides
+        // Body: [{ thingsId, todoistId }]
+        try {
+          const pairs = await request.json() as Array<{ thingsId: string; todoistId: string }>
+          if (!Array.isArray(pairs)) {
+            return new Response(JSON.stringify({ error: 'Invalid body: expected array' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+          }
+
+          const batchSync = new BatchSyncManager(env);
+          await batchSync.loadState();
+
+          const results: Array<{ thingsId: string; todoistId: string; updated: boolean } > = [];
+          for (const { thingsId, todoistId } of pairs) {
+            try {
+              const existing = await batchSync.getMappingByTodoistId(todoistId);
+              if (!existing) {
+                // Attempt to build mapping via current Todoist data
+                const todoistTask = await todoist.request<TodoistTask>(`/tasks/${todoistId}`);
+                const fingerprint = await createTaskFingerprint(todoistTask.content, todoistTask.description);
+                await batchSync.addMapping({
+                  todoistId,
+                  thingsId,
+                  fingerprint,
+                  lastSynced: new Date().toISOString(),
+                  source: 'exact',
+                  version: 2
+                });
+              } else if (existing.thingsId !== thingsId) {
+                // Update thingsId
+                await batchSync.addMapping({ ...existing, thingsId });
+              }
+
+              // Ensure Todoist back-reference
+              try { await todoist.updateTaskWithThingsId(todoistId, thingsId); } catch {}
+
+              results.push({ thingsId, todoistId, updated: true });
+            } catch (e) {
+              results.push({ thingsId, todoistId, updated: false });
+            }
+          }
+
+          await batchSync.flush();
+          return new Response(JSON.stringify({ updated: results.filter(r => r.updated).length, total: results.length, results }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        } catch (error) {
+          return new Response(JSON.stringify({ error: 'Failed to update mappings', message: error instanceof Error ? error.message : 'Unknown error' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
+      }
+
       if (path === '/inbox/clear' && request.method === 'POST') {
         const tasks = await todoist.getInboxTasks(false, env.SYNC_METADATA); // Get all tasks including synced
         const deleteMode = url.searchParams.get('mode') || 'fingerprint'; // Default to fingerprint mode
@@ -719,93 +768,43 @@ export default {
           const results = await Promise.all(
             completedTasks.map(async (task) => {
               try {
-                // Look up the Todoist ID from our KV mapping
-                let metadata = await env.SYNC_METADATA.get(`mapping:things:${task.thingsId}`);
-                
-                // If not found in KV, try to find by extracting Todoist ID from notes
-                if (!metadata) {
-                  try {
-                    const allTasks = await todoist.getInboxTasks(false, env.SYNC_METADATA);
-                    const matchingTask = allTasks.find(t => 
-                      t.description && t.description.includes(`[things-id:${task.thingsId}]`)
-                    );
-                    
-                    if (matchingTask) {
-                      // Create missing metadata entry
-                      const newMetadata: SyncMetadata = {
-                        todoistId: matchingTask.id,
-                        thingsId: task.thingsId,
-                        lastSynced: new Date().toISOString()
-                      };
-                      
-                      // Store minimal mapping (reduced writes)
-                      await env.SYNC_METADATA.put(
-                        `mapping:things:${task.thingsId}`,
-                        JSON.stringify(newMetadata)
-                      );
-                      
-                      metadata = JSON.stringify(newMetadata);
+                // Prefer batch mapping by Things ID
+                const batchSync = new BatchSyncManager(env);
+                const mapping = await batchSync.getMappingByThingsId(task.thingsId);
+                if (!mapping) {
+                  // Fallbacks: legacy KV and description scan
+                  let legacy = await env.SYNC_METADATA.get(`mapping:things:${task.thingsId}`);
+                  if (!legacy) {
+                    try {
+                      const allTasks = await todoist.getInboxTasks(false, env.SYNC_METADATA);
+                      const match = allTasks.find(t => t.description && t.description.includes(`[things-id:${task.thingsId}]`));
+                      if (match) {
+                        legacy = JSON.stringify({ todoistId: match.id, thingsId: task.thingsId, lastSynced: new Date().toISOString() } as SyncMetadata);
+                        await env.SYNC_METADATA.put(`mapping:things:${task.thingsId}`, legacy);
+                      }
+                    } catch (findError) {
+                      console.error('Error finding task by Things ID:', findError);
                     }
-                  } catch (findError) {
-                    console.error('Error finding task by Things ID:', findError);
                   }
-                }
-                
-                if (!metadata) {
-                  return {
-                    thingsId: task.thingsId,
-                    status: 'not_found',
-                    message: 'No Todoist mapping found'
-                  };
-                }
-                
-                const { todoistId } = JSON.parse(metadata) as SyncMetadata;
-                
-                // Close the task in Todoist with retry logic
-                let retryCount = 0;
-                let success = false;
-                
-                while (retryCount < 3 && !success) {
-                  success = await todoist.closeTask(todoistId);
-                  if (!success) {
-                    retryCount++;
-                    await new Promise(resolve => setTimeout(resolve, 1000 * retryCount)); // exponential backoff
+                  if (!legacy) {
+                    return { thingsId: task.thingsId, status: 'not_found', message: 'No Todoist mapping found' };
                   }
+                  const legacyData = JSON.parse(legacy) as SyncMetadata;
+                  const okLegacy = await todoist.closeTask(legacyData.todoistId);
+                  return okLegacy
+                    ? { thingsId: task.thingsId, todoistId: legacyData.todoistId, status: 'completed', completedAt: task.completedAt }
+                    : { thingsId: task.thingsId, todoistId: legacyData.todoistId, status: 'error', message: 'Failed to close task in Todoist' };
                 }
-                
-                if (success) {
-                  // Update metadata with completion time
-                  const updatedMetadata: SyncMetadata = {
-                    ...JSON.parse(metadata),
-                    lastSynced: new Date().toISOString()
-                  };
-                  
-                  // Store minimal mapping (reduced writes)
-                  await env.SYNC_METADATA.put(
-                    `mapping:things:${task.thingsId}`,
-                    JSON.stringify(updatedMetadata)
-                  );
-                  
-                  return {
-                    thingsId: task.thingsId,
-                    todoistId,
-                    status: 'completed',
-                    completedAt: task.completedAt
-                  };
-                } else {
-                  return {
-                    thingsId: task.thingsId,
-                    todoistId,
-                    status: 'error',
-                    message: 'Failed to close task in Todoist'
-                  };
+
+                const ok = await todoist.closeTask(mapping.todoistId);
+                if (ok) {
+                  await batchSync.addMapping({ ...mapping, lastSynced: new Date().toISOString() });
+                  await batchSync.flush();
+                  return { thingsId: task.thingsId, todoistId: mapping.todoistId, status: 'completed', completedAt: task.completedAt };
                 }
+                return { thingsId: task.thingsId, todoistId: mapping.todoistId, status: 'error', message: 'Failed to close task in Todoist' };
               } catch (error) {
-                return {
-                  thingsId: task.thingsId,
-                  status: 'error',
-                  message: error instanceof Error ? error.message : 'Unknown error'
-                };
+                return { thingsId: task.thingsId, status: 'error', message: error instanceof Error ? error.message : 'Unknown error' };
               }
             })
           );

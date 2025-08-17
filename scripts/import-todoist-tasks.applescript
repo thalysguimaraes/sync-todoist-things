@@ -15,6 +15,8 @@ on run argv
     tell application "Things3"
         -- Parse the JSON tasks
         set todoist_tasks to my parseTodoistTasks(jsonString)
+        -- Track created mapping pairs to report back
+        set created_mappings to {}
         
         -- Get existing inbox task titles (normalized)
         set existing_titles to {}
@@ -61,13 +63,18 @@ on run argv
                 
                 set imported_count to imported_count + 1
                 set end of existing_titles to normalized_title -- Add to existing to prevent duplicates in same run
+                -- Capture mapping pair
+                set new_things_id to id of new_todo
+                set end of created_mappings to {thingsId:new_things_id, todoistId:todoist_id}
             else
                 set skipped_count to skipped_count + 1
             end if
         end repeat
     end tell
     
-    return "Imported " & imported_count & " tasks, skipped " & skipped_count & " existing"
+    set summary_line to ("Imported " & imported_count & " tasks, skipped " & skipped_count & " existing")
+    set mappings_json to my mappings_to_json(created_mappings)
+    return summary_line & return & "MAPPINGS:" & mappings_json
 end run
 
 -- Normalize a title: lowercase, trim, collapse whitespace
@@ -113,6 +120,22 @@ on parseTodoistTasks(jsonStr)
     
     return tasks
 end parseTodoistTasks
+
+-- Convert mapping records to JSON string
+-- Input: list of {thingsId:..., todoistId:...}
+on mappings_to_json(mappings)
+    set json_output to "["
+    set first_item to true
+    repeat with m in mappings
+        if not first_item then
+            set json_output to json_output & ","
+        end if
+        set first_item to false
+        set json_output to json_output & "{\"thingsId\":\"" & (thingsId of m) & "\",\"todoistId\":\"" & (todoistId of m) & "\"}"
+    end repeat
+    set json_output to json_output & "]"
+    return json_output
+end mappings_to_json
 
 -- Extract value for a key from JSON-like string
 on extractValue(str, key)

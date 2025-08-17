@@ -100,6 +100,17 @@ if [ "$todoist_count" -gt 0 ] 2>/dev/null; then
         notify "Todoist-Things Sync" "Failed to import tasks to Things"
     else
         log "Import result: $import_result"
+
+        # If importer returned mapping pairs, forward them to the worker to finalize IDs
+        if echo "$import_result" | grep -q '^MAPPINGS:\\['; then
+            mappings_json=$(echo "$import_result" | sed -n 's/^MAPPINGS:\(\[.*\]\)$/\1/p')
+            if [ -n "$mappings_json" ]; then
+                log "Posting created mappings to worker to finalize IDs"
+                curl -s -X POST "${WORKER_URL}/things/created-mappings" \
+                    -H "Content-Type: application/json" \
+                    -d "$mappings_json" >/dev/null || true
+            fi
+        fi
     fi
     
     # Mark as synced in Todoist only if at least one task was imported
