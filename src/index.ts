@@ -779,8 +779,8 @@ export default {
                       const allTasks = await todoist.getInboxTasks(false, env.SYNC_METADATA);
                       const match = allTasks.find(t => t.description && t.description.includes(`[things-id:${task.thingsId}]`));
                       if (match) {
+                        // Reduce KV writes: skip storing legacy mapping; just close the task
                         legacy = JSON.stringify({ todoistId: match.id, thingsId: task.thingsId, lastSynced: new Date().toISOString() } as SyncMetadata);
-                        await env.SYNC_METADATA.put(`mapping:things:${task.thingsId}`, legacy);
                       }
                     } catch (findError) {
                       console.error('Error finding task by Things ID:', findError);
@@ -798,8 +798,7 @@ export default {
 
                 const ok = await todoist.closeTask(mapping.todoistId);
                 if (ok) {
-                  await batchSync.addMapping({ ...mapping, lastSynced: new Date().toISOString() });
-                  await batchSync.flush();
+                  // Reduce KV writes: avoid per-item flush; optional mapping update skipped
                   return { thingsId: task.thingsId, todoistId: mapping.todoistId, status: 'completed', completedAt: task.completedAt };
                 }
                 return { thingsId: task.thingsId, todoistId: mapping.todoistId, status: 'error', message: 'Failed to close task in Todoist' };
