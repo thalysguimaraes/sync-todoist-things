@@ -3,6 +3,7 @@ export interface Env {
   TODOIST_API_URL: string;
   SYNC_METADATA: KVNamespace;
   REPAIR_AUTH_TOKEN?: string;
+  ENABLE_WEBHOOK_LOGS?: string;
 }
 
 export interface ScheduledEvent {
@@ -176,5 +177,10 @@ export interface BatchSyncState {
   };
   thingsIndex: {
     [thingsId: string]: string; // Points to fingerprint
+  };
+  stats?: {
+    mappingCount: number;
+    migratedLegacyMappings?: number;
+    pendingLegacyMigration?: number;
   };
 }

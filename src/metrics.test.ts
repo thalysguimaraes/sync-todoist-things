@@ -40,7 +40,7 @@ describe('MetricsTracker', () => {
   });
 
   describe('recordMetric', () => {
-    it('should store metric in KV with correct prefix', async () => {
+    it('should aggregate metrics under daily key', async () => {
       const metric: SyncMetric = {
         timestamp: new Date().toISOString(),
         type: 'inbox_fetch',
@@ -53,8 +53,11 @@ describe('MetricsTracker', () => {
 
       await metrics.recordMetric(metric);
 
-      const storedKeys = Array.from(kvStore.keys());
-      expect(storedKeys.some(k => k.startsWith('metrics:inbox_fetch:'))).toBe(true);
+      const dateKey = new Date().toISOString().split('T')[0];
+      const stored = kvStore.get(`metrics:daily:${dateKey}`);
+      expect(stored).toBeDefined();
+      const record = JSON.parse(stored!.value);
+      expect(record.byType['inbox_fetch'].count).toBe(1);
     });
 
     it('should store metric with TTL', async () => {
@@ -72,10 +75,8 @@ describe('MetricsTracker', () => {
 
       await metrics.recordMetric(metric);
 
-      const storedKey = Array.from(kvStore.keys()).find(k => k.startsWith('metrics:'));
-      expect(storedKey).toBeDefined();
-      
-      const storedItem = kvStore.get(storedKey!);
+      const dateKey = new Date().toISOString().split('T')[0];
+      const storedItem = kvStore.get(`metrics:daily:${dateKey}`);
       expect(storedItem?.expiry).toBeDefined();
     });
   });
@@ -85,7 +86,6 @@ describe('MetricsTracker', () => {
       const result = await metrics.trackSync(
         'inbox_fetch',
         async () => {
-          // Simulate some work
           await new Promise(resolve => setTimeout(resolve, 10));
           return { tasks: 5 };
         },
@@ -93,9 +93,10 @@ describe('MetricsTracker', () => {
       );
 
       expect(result).toEqual({ tasks: 5 });
-      
-      const storedKeys = Array.from(kvStore.keys());
-      expect(storedKeys.some(k => k.startsWith('metrics:inbox_fetch:'))).toBe(true);
+
+      const dateKey = new Date().toISOString().split('T')[0];
+      const stored = kvStore.get(`metrics:daily:${dateKey}`);
+      expect(stored).toBeDefined();
     });
 
     it('should track failed operation', async () => {
@@ -108,13 +109,11 @@ describe('MetricsTracker', () => {
         )
       ).rejects.toThrow('Network error');
 
-      const storedKeys = Array.from(kvStore.keys());
-      const metricKey = storedKeys.find(k => k.startsWith('metrics:things_sync:'));
-      expect(metricKey).toBeDefined();
-
-      const storedMetric = JSON.parse(kvStore.get(metricKey!)!.value) as SyncMetric;
-      expect(storedMetric.success).toBe(false);
-      expect(storedMetric.errorMessage).toBe('Network error');
+      const dateKey = new Date().toISOString().split('T')[0];
+      const stored = kvStore.get(`metrics:daily:${dateKey}`);
+      expect(stored).toBeDefined();
+      const record = JSON.parse(stored!.value);
+      expect(record.byType['things_sync'].errors).toBe(1);
     });
   });
 
@@ -122,23 +121,23 @@ describe('MetricsTracker', () => {
     beforeEach(async () => {
       // Add test metrics
       const now = Date.now();
-      const metrics: SyncMetric[] = [
+      const metricsData: SyncMetric[] = [
         {
-          timestamp: new Date(now - 3600000).toISOString(), // 1 hour ago
+          timestamp: new Date(now - 3600000).toISOString(),
           type: 'inbox_fetch',
           success: true,
           duration: 100,
           details: { tasksProcessed: 10 }
         },
         {
-          timestamp: new Date(now - 1800000).toISOString(), // 30 min ago
+          timestamp: new Date(now - 1800000).toISOString(),
           type: 'things_sync',
           success: true,
           duration: 200,
           details: { created: 5, existing: 2, errors: 0 }
         },
         {
-          timestamp: new Date(now - 900000).toISOString(), // 15 min ago
+          timestamp: new Date(now - 900000).toISOString(),
           type: 'things_sync',
           success: false,
           duration: 50,
@@ -146,7 +145,7 @@ describe('MetricsTracker', () => {
           errorMessage: 'Test error'
         },
         {
-          timestamp: new Date(now - 300000).toISOString(), // 5 min ago
+          timestamp: new Date(now - 300000).toISOString(),
           type: 'completed_sync',
           success: true,
           duration: 150,
@@ -154,9 +153,8 @@ describe('MetricsTracker', () => {
         }
       ];
 
-      for (const metric of metrics) {
-        const key = `metrics:${metric.type}:${Date.now()}:${Math.random().toString(36).substr(2, 9)}`;
-        kvStore.set(key, { value: JSON.stringify(metric) });
+      for (const metric of metricsData) {
+        await metrics.recordMetric(metric);
       }
     });
 
@@ -200,18 +198,17 @@ describe('MetricsTracker', () => {
     it('should filter metrics by time window', async () => {
       // Add an old metric (25 hours ago)
       const oldMetric: SyncMetric = {
-        timestamp: new Date(Date.now() - 90000000).toISOString(), // 25 hours ago
+        timestamp: new Date(Date.now() - 90000000).toISOString(),
         type: 'inbox_fetch',
         success: true,
         duration: 100,
         details: { tasksProcessed: 5 }
       };
-      
-      const key = `metrics:inbox_fetch:old:test`;
-      kvStore.set(key, { value: JSON.stringify(oldMetric) });
+
+      await metrics.recordMetric(oldMetric);
 
       const summary = await metrics.getMetricsSummary(24);
-      expect(summary.totalSyncs).toBe(4); // Should not include the old metric
+      expect(summary.totalSyncs).toBe(4);
     });
   });
 
@@ -220,30 +217,17 @@ describe('MetricsTracker', () => {
       const now = Date.now();
       
       // Add metrics of different ages
-      const recentMetric: SyncMetric = {
-        timestamp: new Date(now - 86400000).toISOString(), // 1 day old
-        type: 'inbox_fetch',
-        success: true,
-        duration: 100,
-        details: {}
-      };
-      
-      const oldMetric: SyncMetric = {
-        timestamp: new Date(now - 86400000 * 8).toISOString(), // 8 days old
-        type: 'things_sync',
-        success: true,
-        duration: 200,
-        details: {}
-      };
+      const recentDate = new Date(now - 86400000).toISOString().split('T')[0];
+      const oldDate = new Date(now - 86400000 * 8).toISOString().split('T')[0];
 
-      kvStore.set('metrics:inbox_fetch:recent', { value: JSON.stringify(recentMetric) });
-      kvStore.set('metrics:things_sync:old', { value: JSON.stringify(oldMetric) });
+      kvStore.set(`metrics:daily:${recentDate}`, { value: JSON.stringify({ date: recentDate, byType: {}, recentErrors: [], slowestSync: { timestamp: '', type: '', duration: 0 } }) });
+      kvStore.set(`metrics:daily:${oldDate}`, { value: JSON.stringify({ date: oldDate, byType: {}, recentErrors: [], slowestSync: { timestamp: '', type: '', duration: 0 } }) });
 
       const deleted = await metrics.cleanupOldMetrics();
 
       expect(deleted).toBe(1);
-      expect(kvStore.has('metrics:inbox_fetch:recent')).toBe(true);
-      expect(kvStore.has('metrics:things_sync:old')).toBe(false);
+      expect(kvStore.has(`metrics:daily:${recentDate}`)).toBe(true);
+      expect(kvStore.has(`metrics:daily:${oldDate}`)).toBe(false);
     });
   });
 
