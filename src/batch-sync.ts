@@ -21,8 +21,13 @@ export class BatchSyncManager {
         lastUpdated: new Date().toISOString(),
         mappings: {},
         todoistIndex: {},
-        thingsIndex: {}
+        thingsIndex: {},
+        stats: { mappingCount: 0 }
       };
+    }
+
+    if (!this.state.stats) {
+      this.state.stats = { mappingCount: Object.keys(this.state.mappings).length };
     }
 
     return this.state;
@@ -56,7 +61,9 @@ export class BatchSyncManager {
     this.state!.mappings[fingerprint] = mapping;
     this.state!.todoistIndex[mapping.todoistId] = fingerprint;
     this.state!.thingsIndex[mapping.thingsId] = fingerprint;
-    
+
+    this.state!.stats!.mappingCount += 1;
+
     this.isDirty = true;
   }
 
@@ -68,8 +75,9 @@ export class BatchSyncManager {
     delete this.state!.mappings[fingerprint];
     delete this.state!.todoistIndex[mapping.todoistId];
     delete this.state!.thingsIndex[mapping.thingsId];
-    
+
     this.pendingUpdates.delete(fingerprint);
+    this.state!.stats!.mappingCount = Math.max(0, this.state!.stats!.mappingCount - 1);
     this.isDirty = true;
   }
 
@@ -79,6 +87,7 @@ export class BatchSyncManager {
     }
 
     this.state.lastUpdated = new Date().toISOString();
+    this.state.stats!.mappingCount = Object.keys(this.state.mappings).length;
     
     try {
       await this.env.SYNC_METADATA.put(
@@ -106,7 +115,7 @@ export class BatchSyncManager {
 
   async getMappingCount(): Promise<number> {
     await this.loadState();
-    return Object.keys(this.state!.mappings).length;
+    return this.state!.stats?.mappingCount ?? Object.keys(this.state!.mappings).length;
   }
 
   async clearAll(): Promise<void> {
@@ -115,7 +124,8 @@ export class BatchSyncManager {
       lastUpdated: new Date().toISOString(),
       mappings: {},
       todoistIndex: {},
-      thingsIndex: {}
+      thingsIndex: {},
+      stats: { mappingCount: 0 }
     };
     this.pendingUpdates.clear();
     this.isDirty = true;
@@ -151,9 +161,12 @@ export class BatchSyncManager {
     }
     
     if (this.isDirty) {
+      this.state!.stats!.mappingCount = Object.keys(this.state!.mappings).length;
+      this.state!.stats!.migratedLegacyMappings = (this.state!.stats!.migratedLegacyMappings || 0) + migrated;
+      this.state!.stats!.pendingLegacyMigration = 0;
       await this.flush();
     }
-    
+
     return migrated;
   }
 }

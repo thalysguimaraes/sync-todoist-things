@@ -228,11 +228,13 @@ export class WebhookDispatcher {
         status: 'pending'
       };
 
-      await this.env.SYNC_METADATA.put(
-        `sync-request:${syncRequest.id}`, 
-        JSON.stringify(syncRequest),
-        { expirationTtl: 600 } // Expire in 10 minutes
-      );
+      if (this.env.ENABLE_WEBHOOK_LOGS === 'true') {
+        await this.env.SYNC_METADATA.put(
+          `sync-request:${syncRequest.id}`,
+          JSON.stringify(syncRequest),
+          { expirationTtl: 300 }
+        );
+      }
 
       return true;
     } catch (error) {

@@ -327,7 +327,9 @@ export class WebhookHandlers {
           todoistId,
           status: 'pending'
         };
-        await this.env.SYNC_METADATA.put(`sync-request:${request.id}`, JSON.stringify(request), { expirationTtl: 3600 });
+        if (this.env.ENABLE_WEBHOOK_LOGS === 'true') {
+          await this.env.SYNC_METADATA.put(`sync-request:${request.id}`, JSON.stringify(request), { expirationTtl: 300 });
+        }
       }
       return { success: true };
     } catch (e) {
