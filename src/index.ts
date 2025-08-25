@@ -12,6 +12,10 @@ import {
   ScheduledEvent,
   BatchSyncState
 } from './types';
+import { D1KV } from './storage/d1-kv';
+import { MobileSyncRequest } from './mobile-types';
+import { MobileAuthManager } from './mobile-auth';
+import { MobileSyncManager } from './mobile-sync';
 import { BatchSyncManager } from './batch-sync';
 import { TodoistClient } from './todoist';
 import { convertToThingsFormat, generateThingsUrl } from './things';
@@ -27,6 +31,7 @@ import { MetricsTracker } from './metrics';
 import { ConflictResolver } from './conflicts';
 import { ConfigManager } from './config';
 import { WebhookDispatcher } from './webhooks/dispatcher';
+import { KVMigrationManager } from './migration/kv-migration';
 import { WebhookSource, OutboundWebhookPayload, OutboundWebhookEvent } from './webhooks/types';
 
 // Helper function to send outbound webhooks
@@ -106,6 +111,10 @@ async function sendOutboundWebhook(
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    // Override KV with D1-backed adapter
+    const d1kv = new D1KV(env.DB);
+    env = { ...env, SYNC_METADATA: d1kv as unknown as KVNamespace };
+    
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -122,6 +131,89 @@ export default {
     try {
       const todoist = new TodoistClient(env);
       const metrics = new MetricsTracker(env);
+
+      // Mobile sync endpoints
+      if (path === '/mobile/register' && request.method === 'POST') {
+        const mobileAuth = new MobileAuthManager(env);
+        
+        try {
+          const body = await request.json().catch(() => ({})) as { platform?: string; appVersion?: string };
+          const registration = await mobileAuth.registerDevice(
+            body.platform,
+            body.appVersion
+          );
+
+          return new Response(JSON.stringify({
+            deviceId: registration.deviceId,
+            secret: registration.secret,
+            registeredAt: registration.registeredAt
+          }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({
+            error: 'Registration failed',
+            message: error instanceof Error ? error.message : 'Unknown error'
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      if (path === '/mobile/sync' && request.method === 'POST') {
+        const mobileSync = new MobileSyncManager(env);
+        
+        try {
+          const syncRequest = await request.json() as MobileSyncRequest;
+          const response = await mobileSync.processSyncRequest(syncRequest);
+
+          return new Response(JSON.stringify(response), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({
+            success: false,
+            error: error instanceof Error ? error.message : 'Sync failed',
+            serverTime: new Date().toISOString()
+          }), {
+            status: error instanceof Error && error.message.includes('Invalid signature') ? 401 : 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
+
+      if (path === '/mobile/changes' && request.method === 'GET') {
+        const mobileSync = new MobileSyncManager(env);
+        
+        try {
+          const deviceId = url.searchParams.get('deviceId');
+          const since = url.searchParams.get('since') || new Date(0).toISOString();
+
+          if (!deviceId) {
+            return new Response(JSON.stringify({
+              error: 'deviceId parameter required'
+            }), {
+              status: 400,
+              headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+            });
+          }
+
+          const changes = await mobileSync.getChanges(deviceId, since);
+
+          return new Response(JSON.stringify(changes), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({
+            error: error instanceof Error ? error.message : 'Failed to get changes',
+            serverTime: new Date().toISOString()
+          }), {
+            status: error instanceof Error && error.message.includes('not registered') ? 401 : 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+      }
 
       // Webhook processing endpoints (for actual webhook events)
       if (path.startsWith('/webhook/') && ['github', 'notion', 'slack', 'generic', 'todoist'].includes(path.split('/')[2])) {
@@ -1100,23 +1192,70 @@ export default {
         let mappingCount = 0;
         let lastUpdated = '';
         let migration = { migratedLegacyMappings: 0, pendingLegacyMigration: 0 };
+        let hashCount = 0;
+        let thingsMappings = 0;
+        let todoistMappings = 0;
 
         if (stateData) {
           const state = JSON.parse(stateData) as BatchSyncState;
           mappingCount = state.stats?.mappingCount ?? Object.keys(state.mappings).length;
+          hashCount = mappingCount;
+          thingsMappings = hashCount;
+          todoistMappings = hashCount;
           lastUpdated = state.lastUpdated;
           migration = {
-            migratedLegacyMappings: state.stats?.migratedLegacyMappings || 0,
+            migratedLegacyMappings: state.stats?.migratedLegacyMappings || hashCount,
             pendingLegacyMigration: state.stats?.pendingLegacyMigration || 0
           };
         }
 
+        // Check Todoist tasks with sync labels  
+        const allTasks = await todoist.getInboxTasks(false, env.SYNC_METADATA);
+        const taggedTasks = allTasks.filter(task => 
+          task.labels.includes('synced-to-things') || 
+          task.labels.includes('synced-from-things')
+        );
+
+        let taggedTasksWithFingerprints = 0;
+        for (const task of taggedTasks) {
+          try {
+            const fingerprint = await createTaskFingerprint(task.content, task.description);
+            const hashMapping = await env.SYNC_METADATA.get(`hash:${fingerprint.primaryHash}`);
+            if (hashMapping) {
+              taggedTasksWithFingerprints++;
+            }
+          } catch (error) {
+            // Skip errors
+          }
+        }
+
         return new Response(JSON.stringify({
           syncLocked: isLocked,
-          batch: {
-            mappingCount,
-            lastUpdated,
-            migration
+          legacy: {
+            mappings: {
+              things: thingsMappings,
+              todoist: todoistMappings,
+              total: thingsMappings + todoistMappings
+            },
+            taggedTasks: {
+              total: taggedTasks.length,
+              withFingerprints: taggedTasksWithFingerprints,
+              pendingMigration: taggedTasks.length - taggedTasksWithFingerprints
+            }
+          },
+          fingerprint: {
+            hashMappings: hashCount,
+            migratedLegacyMappings: migration.migratedLegacyMappings,
+            pendingLegacyMigration: migration.pendingLegacyMigration
+          },
+          migration: {
+            progress: migration.pendingLegacyMigration === 0 ? '100%' : `${Math.round((migration.migratedLegacyMappings / (migration.migratedLegacyMappings + migration.pendingLegacyMigration)) * 100)}%`,
+            isComplete: migration.pendingLegacyMigration === 0 && (taggedTasks.length - taggedTasksWithFingerprints) === 0,
+            recommendations: [
+              ...(migration.pendingLegacyMigration > 0 ? ['Run POST /migrate to migrate legacy mappings'] : []),
+              ...((taggedTasks.length - taggedTasksWithFingerprints) > 0 ? ['Run POST /migrate to migrate tagged tasks'] : []),
+              ...(migration.pendingLegacyMigration === 0 && (taggedTasks.length - taggedTasksWithFingerprints) === 0 ? ['Migration complete! System ready for tag-free operation'] : [])
+            ]
           },
           timestamp: new Date().toISOString()
         }), {
@@ -1515,18 +1654,9 @@ export default {
           const state = await batchSync.loadState();
           results.mappings = Object.values(state.mappings);
 
-          // Get all legacy mappings (for visibility)
-          const legacyList = await env.SYNC_METADATA.list({ prefix: 'mapping:' });
-          for (const key of legacyList.keys) {
-            const mapping = await env.SYNC_METADATA.get(key.name);
-            if (mapping) {
-              const syncMetadata = JSON.parse(mapping) as SyncMetadata;
-              results.legacyMappings.push({
-                key: key.name,
-                ...syncMetadata
-              });
-            }
-          }
+          // Legacy mappings are no longer supported - all in batch state
+          // Set to empty array for backward compatibility
+          results.legacyMappings = [];
 
           // Get all current Todoist tasks
           const allTasks = await todoist.getInboxTasks(false, env.SYNC_METADATA);
@@ -1570,6 +1700,98 @@ export default {
             status: 500,
             headers: { ...corsHeaders, 'Content-Type': 'application/json' },
           });
+        }
+      }
+
+      // Migration endpoints
+      if (path === '/kv/migration/verify' && request.method === 'GET') {
+        try {
+          const manager = new KVMigrationManager(env);
+          const result = await manager.verifyMigration();
+          return new Response(JSON.stringify(result), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        } catch (error) {
+          return new Response(JSON.stringify({ error: 'Verification failed', message: error instanceof Error ? error.message : 'Unknown error' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
+      }
+
+      if (path === '/kv/migration/estimate' && request.method === 'GET') {
+        try {
+          const manager = new KVMigrationManager(env);
+          const estimate = await manager.estimateReduction();
+          return new Response(JSON.stringify(estimate), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        } catch (error) {
+          return new Response(JSON.stringify({ error: 'Estimation failed', message: error instanceof Error ? error.message : 'Unknown error' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
+      }
+
+      if (path === '/kv/migration/run' && request.method === 'POST') {
+        try {
+          const manager = new KVMigrationManager(env);
+          // Safe run: keep originals for a rollback window
+          const result = await manager.runFullMigration();
+          return new Response(JSON.stringify(result), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        } catch (error) {
+          return new Response(JSON.stringify({ error: 'Migration failed', message: error instanceof Error ? error.message : 'Unknown error' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
+      }
+
+      if (path === '/kv/migration/cleanup' && request.method === 'POST') {
+        try {
+          const aggressive = url.searchParams.get('aggressive') === 'true';
+          const manager = new KVMigrationManager(env);
+          const result = await (manager as any).cleanupLegacyMappings(aggressive);
+          return new Response(JSON.stringify(result), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        } catch (error) {
+          return new Response(JSON.stringify({ error: 'Cleanup failed', message: error instanceof Error ? error.message : 'Unknown error' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
+      }
+
+      // Page-wise migration endpoints to avoid subrequest limits
+      if (path === '/kv/migration/metrics-page' && request.method === 'POST') {
+        try {
+          const keepOriginals = url.searchParams.get('keepOriginals') !== 'false';
+          const limit = parseInt(url.searchParams.get('limit') || '200', 10);
+          const cursor = url.searchParams.get('cursor') || undefined;
+          const aggregatorModule = await import('./metrics-aggregator');
+          const aggregator = new aggregatorModule.MetricsAggregator(env);
+          const page = await aggregator.migrateExistingMetricsPage({ keepOriginals, limit, cursor });
+          return new Response(JSON.stringify(page), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        } catch (error) {
+          return new Response(JSON.stringify({ error: 'Metrics page migration failed', message: error instanceof Error ? error.message : 'Unknown error' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
+      }
+
+      if (path === '/kv/migration/webhooks-page' && request.method === 'POST') {
+        try {
+          const limit = parseInt(url.searchParams.get('limit') || '200', 10);
+          const cursor = url.searchParams.get('cursor') || undefined;
+          const { WebhookBatchManager } = await import('./webhook-batch-manager');
+          const wb = new WebhookBatchManager(env);
+          const page = await wb.migrateExistingDeliveries({ limit, cursor });
+          return new Response(JSON.stringify(page), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        } catch (error) {
+          return new Response(JSON.stringify({ error: 'Webhook page migration failed', message: error instanceof Error ? error.message : 'Unknown error' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
+      }
+
+      if (path === '/kv/migration/cleanup-page' && request.method === 'POST') {
+        try {
+          const prefix = url.searchParams.get('prefix');
+          const limit = parseInt(url.searchParams.get('limit') || '200', 10);
+          const cursor = url.searchParams.get('cursor') || undefined;
+          const allowed = new Set(['mobile-mapping:', 'webhook-delivery:', 'mapping:', 'hash:', 'sync-request:', 'sync-response:']);
+          if (!prefix || !allowed.has(prefix)) {
+            return new Response(JSON.stringify({ error: 'Invalid or missing prefix', allowed: Array.from(allowed) }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+          }
+          const page = await env.SYNC_METADATA.list({ prefix, limit, cursor } as any);
+          let deleted = 0;
+          for (const key of page.keys) {
+            await env.SYNC_METADATA.delete(key.name);
+            deleted++;
+          }
+          return new Response(JSON.stringify({ deleted, nextCursor: (page as any).cursor, listComplete: Boolean((page as any).list_complete) }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        } catch (error) {
+          return new Response(JSON.stringify({ error: 'Cleanup page failed', message: error instanceof Error ? error.message : 'Unknown error' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
         }
       }
 
@@ -1708,24 +1930,20 @@ export default {
         try {
           if (direction === 'both' || direction === 'clear_mappings') {
             // Step 1: Clear all existing mappings for a fresh start
-            const hashList = await env.SYNC_METADATA.list({ prefix: 'hash:' });
-            for (const key of hashList.keys) {
-              if (!dryRun) {
-                await env.SYNC_METADATA.delete(key.name);
-              }
-              results.mappingsCleared++;
-              results.actions.push(`Clear mapping: ${key.name}`);
+            // Use batch state instead of listing individual keys
+            const batchSync = new BatchSyncManager(env);
+            const state = await batchSync.loadState();
+            const mappingCount = Object.keys(state.mappings).length;
+            
+            if (!dryRun) {
+              // Clear the entire batch state
+              await env.SYNC_METADATA.delete('sync-state:batch');
+              // Reinitialize with empty state
+              await batchSync.flush();
             }
-
-            // Clear legacy mappings too
-            const legacyList = await env.SYNC_METADATA.list({ prefix: 'mapping:' });
-            for (const key of legacyList.keys) {
-              if (!dryRun) {
-                await env.SYNC_METADATA.delete(key.name);
-              }
-              results.mappingsCleared++;
-              results.actions.push(`Clear legacy: ${key.name}`);
-            }
+            
+            results.mappingsCleared = mappingCount;
+            results.actions.push(`Cleared ${mappingCount} mappings from batch state`);
           }
 
           if (direction === 'both' || direction === 'todoist_to_things') {
@@ -2249,26 +2467,11 @@ export default {
       if (path === '/webhook/deliveries' && request.method === 'GET') {
         try {
           const hours = parseInt(url.searchParams.get('hours') || '24');
-          const deliveries = await env.SYNC_METADATA.list({ prefix: 'webhook-delivery:' });
-          const results = [];
-          const cutoffTime = Date.now() - (hours * 60 * 60 * 1000);
-
-          for (const key of deliveries.keys) {
-            try {
-              const delivery = await env.SYNC_METADATA.get(key.name);
-              if (delivery) {
-                const deliveryData = JSON.parse(delivery);
-                if (new Date(deliveryData.createdAt).getTime() > cutoffTime) {
-                  results.push(deliveryData);
-                }
-              }
-            } catch {
-              // Skip invalid entries
-            }
-          }
-
-          // Sort by creation time (newest first)
-          results.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+          
+          // Use WebhookBatchManager for efficient retrieval
+          const { WebhookBatchManager } = await import('./webhook-batch-manager');
+          const webhookBatch = new WebhookBatchManager(env);
+          const results = await webhookBatch.getDeliveries(hours);
 
           return new Response(JSON.stringify({
             deliveries: results,
@@ -2479,11 +2682,16 @@ export default {
   },
 
   async scheduled(event: ScheduledEvent, env: Env): Promise<void> {
+    // Override KV with D1-backed adapter
+    const d1kv = new D1KV(env.DB);
+    env = { ...env, SYNC_METADATA: d1kv as unknown as KVNamespace };
+    
     // CF Workers cron-triggered sync - runs every 2 minutes
     console.log('Starting cron-triggered bidirectional sync at:', new Date().toISOString());
     
     const metrics = new MetricsTracker(env);
     const startTime = Date.now();
+    let cronLockToken: string | null = null;
     
     try {
       // Check if sync is already locked to prevent concurrent syncs
@@ -2505,7 +2713,7 @@ export default {
       }
       
       // Acquire sync lock
-      const cronLockToken = await acquireSyncLock(env.SYNC_METADATA);
+      cronLockToken = await acquireSyncLock(env.SYNC_METADATA);
       if (!cronLockToken) {
         console.log('Another sync is already in progress, skipping cron trigger');
         return;
