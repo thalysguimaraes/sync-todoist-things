@@ -2,6 +2,7 @@ export interface Env {
   TODOIST_API_TOKEN: string;
   TODOIST_API_URL: string;
   SYNC_METADATA: KVNamespace;
+  DB: D1Database;
   REPAIR_AUTH_TOKEN?: string;
 }
 

@@ -7,10 +7,11 @@ TODOIST_API_URL = "https://api.todoist.com/rest/v2"
 # Generate a secure token with: openssl rand -hex 32
 REPAIR_AUTH_TOKEN = "86143aa681404dde9c74103a78ce2fbcd8a1cd2cd7bf908b42395f369e90c436"
 
-# KV namespace for storing sync metadata and ID mappings
-[[kv_namespaces]]
-binding = "SYNC_METADATA"
-id = "63e1a66560e24129bfe0915501554381"
+# D1 database for storing sync metadata and ID mappings
+[[d1_databases]]
+binding = "DB"
+database_name = "todoist-things-sync"
+database_id = "24d38a9c-3314-494e-b402-488c3c070fe5"
 
 # Run `wrangler secret put TODOIST_API_TOKEN` to set your token
 
