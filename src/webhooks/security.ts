@@ -2,6 +2,8 @@
 import { WebhookSource, WebhookRateLimit } from './types';
 import { Env } from '../types';
 
+const inMemoryRateLimits = new Map<string, WebhookRateLimit>();
+
 export class WebhookSecurity {
   constructor(private env: Env) {}
 
@@ -183,18 +185,24 @@ export class WebhookSecurity {
     const currentHour = Math.floor(now / 3600000); // Hours since epoch
 
     const rateLimitKey = `webhook-rate:${source}`;
-    const rateLimitData = await this.env.SYNC_METADATA.get(rateLimitKey);
 
-    let rateLimit: WebhookRateLimit = {
-      source,
-      minute: 0,
-      hour: 0,
-      resetMinute: currentMinute,
-      resetHour: currentHour
-    };
+    let rateLimit: WebhookRateLimit | undefined = inMemoryRateLimits.get(rateLimitKey);
 
-    if (rateLimitData) {
-      rateLimit = JSON.parse(rateLimitData);
+    if (!rateLimit) {
+      const rateLimitData = await this.env.SYNC_METADATA.get(rateLimitKey);
+      if (rateLimitData) {
+        rateLimit = JSON.parse(rateLimitData) as WebhookRateLimit;
+      }
+    }
+
+    if (!rateLimit) {
+      rateLimit = {
+        source,
+        minute: 0,
+        hour: 0,
+        resetMinute: currentMinute,
+        resetHour: currentHour
+      };
     }
 
     // Reset counters if time period has passed
@@ -221,10 +229,13 @@ export class WebhookSecurity {
     rateLimit.minute += 1;
     rateLimit.hour += 1;
 
-    // Save updated rate limit
-    await this.env.SYNC_METADATA.put(rateLimitKey, JSON.stringify(rateLimit), {
-      expirationTtl: 3600 // Expire in 1 hour
-    });
+    inMemoryRateLimits.set(rateLimitKey, rateLimit);
+
+    if (rateLimit.minute % 10 === 0) {
+      await this.env.SYNC_METADATA.put(rateLimitKey, JSON.stringify(rateLimit), {
+        expirationTtl: 3600
+      });
+    }
 
     return { allowed: true };
   }

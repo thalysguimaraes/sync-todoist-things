@@ -4,6 +4,7 @@ export interface Env {
   SYNC_METADATA: KVNamespace;
   DB: D1Database;
   REPAIR_AUTH_TOKEN?: string;
+  ENABLE_WEBHOOK_LOGS?: string;
 }
 
 export interface ScheduledEvent {
@@ -177,5 +178,10 @@ export interface BatchSyncState {
   };
   thingsIndex: {
     [thingsId: string]: string; // Points to fingerprint
+  };
+  stats?: {
+    mappingCount: number;
+    migratedLegacyMappings?: number;
+    pendingLegacyMigration?: number;
   };
 }

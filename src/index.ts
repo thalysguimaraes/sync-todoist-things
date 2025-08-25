@@ -1187,28 +1187,29 @@ export default {
         const lockKey = 'sync:lock';
         const lockData = await env.SYNC_METADATA.get(lockKey);
         const isLocked = lockData ? JSON.parse(lockData).timestamp > Date.now() - 30000 : false;
-        
-        // Get stats from batch state instead of listing all keys
-        const batchState = await env.SYNC_METADATA.get('sync-state:batch');
+
+        const stateData = await env.SYNC_METADATA.get('sync-state:batch');
+        let mappingCount = 0;
+        let lastUpdated = '';
+        let migration = { migratedLegacyMappings: 0, pendingLegacyMigration: 0 };
+        let hashCount = 0;
         let thingsMappings = 0;
         let todoistMappings = 0;
-        let hashCount = 0;
-        
-        if (batchState) {
-          const state = JSON.parse(batchState);
-          hashCount = Object.keys(state.mappings || {}).length;
-          thingsMappings = hashCount; // All are synced
-          todoistMappings = hashCount; // All are synced
-        }
-        
-        // Analyze migration status from batch state
-        let migratedMappings = hashCount;
-        let pendingMigration = 0;
-        
-        // No need to iterate through individual keys anymore
-        // All mappings in batch state are considered migrated
 
-        // Check Todoist tasks with sync labels
+        if (stateData) {
+          const state = JSON.parse(stateData) as BatchSyncState;
+          mappingCount = state.stats?.mappingCount ?? Object.keys(state.mappings).length;
+          hashCount = mappingCount;
+          thingsMappings = hashCount;
+          todoistMappings = hashCount;
+          lastUpdated = state.lastUpdated;
+          migration = {
+            migratedLegacyMappings: state.stats?.migratedLegacyMappings || hashCount,
+            pendingLegacyMigration: state.stats?.pendingLegacyMigration || 0
+          };
+        }
+
+        // Check Todoist tasks with sync labels  
         const allTasks = await todoist.getInboxTasks(false, env.SYNC_METADATA);
         const taggedTasks = allTasks.filter(task => 
           task.labels.includes('synced-to-things') || 
@@ -1227,8 +1228,8 @@ export default {
             // Skip errors
           }
         }
-        
-        return new Response(JSON.stringify({ 
+
+        return new Response(JSON.stringify({
           syncLocked: isLocked,
           legacy: {
             mappings: {
@@ -1244,16 +1245,16 @@ export default {
           },
           fingerprint: {
             hashMappings: hashCount,
-            migratedLegacyMappings: migratedMappings,
-            pendingLegacyMigration: pendingMigration
+            migratedLegacyMappings: migration.migratedLegacyMappings,
+            pendingLegacyMigration: migration.pendingLegacyMigration
           },
           migration: {
-            progress: '100%', // All batch state mappings are migrated
-            isComplete: pendingMigration === 0 && (taggedTasks.length - taggedTasksWithFingerprints) === 0,
+            progress: migration.pendingLegacyMigration === 0 ? '100%' : `${Math.round((migration.migratedLegacyMappings / (migration.migratedLegacyMappings + migration.pendingLegacyMigration)) * 100)}%`,
+            isComplete: migration.pendingLegacyMigration === 0 && (taggedTasks.length - taggedTasksWithFingerprints) === 0,
             recommendations: [
-              ...(pendingMigration > 0 ? ['Run POST /migrate to migrate legacy mappings'] : []),
+              ...(migration.pendingLegacyMigration > 0 ? ['Run POST /migrate to migrate legacy mappings'] : []),
               ...((taggedTasks.length - taggedTasksWithFingerprints) > 0 ? ['Run POST /migrate to migrate tagged tasks'] : []),
-              ...(pendingMigration === 0 && (taggedTasks.length - taggedTasksWithFingerprints) === 0 ? ['Migration complete! System ready for tag-free operation'] : [])
+              ...(migration.pendingLegacyMigration === 0 && (taggedTasks.length - taggedTasksWithFingerprints) === 0 ? ['Migration complete! System ready for tag-free operation'] : [])
             ]
           },
           timestamp: new Date().toISOString()
@@ -2735,7 +2736,7 @@ export default {
           status: 'pending'
         };
         
-        await env.SYNC_METADATA.put(`sync-request:${syncRequest.id}`, JSON.stringify(syncRequest));
+        await env.SYNC_METADATA.put(`sync-request:${syncRequest.id}`, JSON.stringify(syncRequest), { expirationTtl: 600 });
         
         // Record metric for coordination
         await metrics.recordMetric({
